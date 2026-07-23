@@ -1,0 +1,9 @@
+**
+!LICENSE
+!pyproject.toml
+!src/
+!src/**
+!pa2bridge/
+!pa2bridge/requirements.txt
+!pa2bridge/rootfs/
+!pa2bridge/rootfs/**

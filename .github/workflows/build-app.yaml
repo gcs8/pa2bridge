@@ -1,0 +1,341 @@
+name: Build Home Assistant App
+
+on:
+  workflow_run:
+    workflows:
+      - Release Candidate
+    types:
+      - completed
+
+concurrency:
+  group: pa2bridge-release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verify release candidate
+    if: >-
+      github.repository == 'gcs8/pa2bridge' &&
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-24.04
+    outputs:
+      reviewed_identity: ${{ steps.identity.outputs.reviewed_identity }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.workflow_run.head_sha }}
+      - name: Verify independently reviewed tree identity
+        id: identity
+        env:
+          EXPECTED_REVIEWED_TREE_SHA256: ${{ vars.REVIEWED_TREE_SHA256 }}
+        run: |
+          test -n "${EXPECTED_REVIEWED_TREE_SHA256}"
+          python -I -S - <<'PY'
+          import hashlib
+          import os
+          import pathlib
+          import subprocess
+
+          entries = []
+          for record in subprocess.check_output(
+              ["git", "ls-files", "--stage", "-z"]
+          ).split(b"\0"):
+              if not record:
+                  continue
+              metadata, raw_path = record.split(b"\t", 1)
+              mode, _object_id, stage = metadata.decode("ascii").split()
+              if stage != "0" or mode not in {"100644", "100755"}:
+                  raise SystemExit("unsupported or unresolved Git index entry")
+              path = raw_path.decode("utf-8")
+              entries.append((path, mode, pathlib.Path(path).read_bytes()))
+
+          digest = hashlib.sha256()
+          for path, mode, data in sorted(entries):
+              file_digest = hashlib.sha256(data).hexdigest()
+              digest.update(
+                  f"{path}\0{mode}\0{len(data)}\0{file_digest}\n".encode()
+              )
+          actual = digest.hexdigest()
+          expected = os.environ["EXPECTED_REVIEWED_TREE_SHA256"]
+          if actual != expected:
+              raise SystemExit(
+                  f"reviewed tree identity mismatch: expected {expected}, got {actual}"
+              )
+          print(actual)
+          PY
+          echo "reviewed_identity=${EXPECTED_REVIEWED_TREE_SHA256}" >> "${GITHUB_OUTPUT}"
+      - name: Install uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+        with:
+          version: "0.11.15"
+          enable-cache: true
+      - name: Install locked dependencies
+        run: |
+          uv sync --frozen --group dev --no-install-project
+          for package in pa2bridge hatchling editables; do
+            if uv pip show "$package" >/dev/null 2>&1; then
+              echo "unexpected project/build package installed: $package" >&2
+              exit 1
+            fi
+          done
+      - name: Run tests with coverage gate
+        run: uv run --no-sync pytest -q --cov="$PWD/src/pa2bridge" --cov-report=term-missing --cov-fail-under=85
+      - name: Run Ruff
+        run: uv run --no-sync ruff check src tests scripts
+      - name: Audit Python dependencies
+        run: |
+          uv export --frozen --no-dev --no-emit-project \
+            --format requirements-txt \
+            --output-file /tmp/pa2bridge-audit-requirements.txt
+          uv run --no-sync pip-audit --strict \
+            --requirement /tmp/pa2bridge-audit-requirements.txt
+      - name: Scan repository for secrets
+        uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
+      - name: Run Home Assistant App linter
+        uses: frenck/action-addon-linter@f995494fd84fae6310d23617e66d0e37de4f14eb # v2.21.0
+        with:
+          path: ./pa2bridge
+
+  prepare:
+    name: Prepare image build
+    needs: verify
+    if: github.repository == 'gcs8/pa2bridge'
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.info.outputs.version }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+          ref: ${{ github.event.workflow_run.head_sha }}
+      - name: Read app information
+        id: info
+        uses: home-assistant/actions/helpers/info@e3fb68ebda13d88a0d695082f471ba2c83d025fb
+        with:
+          path: ./pa2bridge
+      - name: Verify release tag matches app version and candidate commit
+        env:
+          CANDIDATE_SHA: ${{ github.event.workflow_run.head_sha }}
+          TRIGGER_EVENT: ${{ github.event.workflow_run.event }}
+          TRIGGER_TAG: ${{ github.event.workflow_run.head_branch }}
+          VERSION: ${{ steps.info.outputs.version }}
+        run: |
+          test "${TRIGGER_EVENT}" = "push"
+          test "${TRIGGER_TAG}" = "v${VERSION}"
+          git fetch --force --no-tags origin "refs/tags/${TRIGGER_TAG}:refs/tags/${TRIGGER_TAG}"
+          tag_commit="$(git rev-parse "refs/tags/v${VERSION}^{commit}")"
+          test "${tag_commit}" = "${CANDIDATE_SHA}"
+  build:
+    name: Build, scan, and publish ${{ matrix.arch }} image
+    needs:
+      - verify
+      - prepare
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+          - arch: aarch64
+            platform: linux/arm64
+    env:
+      EXPECTED_PUSH_TAG: staging-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.arch }}
+      ARCH_IMAGE: ghcr.io/gcs8/pa2bridge:staging-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.arch }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.workflow_run.head_sha }}
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build unpushed image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: ./pa2bridge/Dockerfile
+          platforms: ${{ matrix.platform }}
+          load: true
+          push: false
+          tags: ${{ env.ARCH_IMAGE }}
+          build-args: |
+            BUILD_ARCH=${{ matrix.arch }}
+            BUILD_VERSION=${{ needs.prepare.outputs.version }}
+          labels: |
+            io.hass.type=app
+            io.hass.name=PA2Bridge
+            io.hass.description=Safe dbx DriveRack PA2 control through Home Assistant
+      - name: Scan exact image
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.ARCH_IMAGE }}
+          format: table
+          exit-code: "1"
+          ignore-unfixed: false
+          scanners: vuln,secret,misconfig
+          severity: HIGH,CRITICAL
+          vuln-type: os,library
+      - name: Push scanned image and capture immutable digest
+        id: push
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          docker push "${ARCH_IMAGE}" | tee /tmp/pa2bridge-docker-push.log
+          digest="$(python - <<'PY'
+          import os
+          import pathlib
+          import re
+
+          text = pathlib.Path('/tmp/pa2bridge-docker-push.log').read_text()
+          expected_tag = os.environ['EXPECTED_PUSH_TAG']
+          matches = re.findall(
+              rf'^{re.escape(expected_tag)}: digest: (sha256:[0-9a-f]{{64}}) size: [0-9]+\s*$',
+              text,
+              re.MULTILINE,
+          )
+          if len(matches) != 1:
+              raise SystemExit(f'expected one pushed digest, found {len(matches)}')
+          print(matches[0])
+          PY
+          )"
+          case "${digest}" in
+            sha256:????????????????????????????????????????????????????????????????) ;;
+            *) echo "invalid pushed image digest" >&2; exit 1 ;;
+          esac
+          mkdir -p /tmp/pa2bridge-image-digest
+          printf '%s\n' "${digest}" > "/tmp/pa2bridge-image-digest/${ARCH}.txt"
+      - name: Preserve scanned image digest
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: pa2bridge-digest-${{ matrix.arch }}
+          path: /tmp/pa2bridge-image-digest/${{ matrix.arch }}.txt
+          if-no-files-found: error
+          retention-days: 1
+
+  manifest:
+    name: Publish multi-architecture manifest
+    needs:
+      - verify
+      - prepare
+      - build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Check out reviewed commit for final tag verification
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+          ref: ${{ github.event.workflow_run.head_sha }}
+      - name: Revalidate release tag before registry access
+        env:
+          CANDIDATE_SHA: ${{ github.event.workflow_run.head_sha }}
+          TRIGGER_EVENT: ${{ github.event.workflow_run.event }}
+          TRIGGER_TAG: ${{ github.event.workflow_run.head_branch }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          test "${TRIGGER_EVENT}" = "push"
+          test "${TRIGGER_TAG}" = "v${VERSION}"
+          git fetch --force --no-tags origin "refs/tags/${TRIGGER_TAG}:refs/tags/${TRIGGER_TAG}"
+          tag_commit="$(git rev-parse "refs/tags/v${VERSION}^{commit}")"
+          test "${tag_commit}" = "${CANDIDATE_SHA}"
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Download scanned image digests
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: pa2bridge-digest-*
+          path: /tmp/pa2bridge-image-digests
+          merge-multiple: false
+      - name: Publish manifest
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          VERIFIED_REVIEWED_TREE_SHA256: ${{ needs.verify.outputs.reviewed_identity }}
+          CURRENT_REVIEWED_TREE_SHA256: ${{ vars.REVIEWED_TREE_SHA256 }}
+          DIGEST_ARTIFACT_DIR: /tmp/pa2bridge-image-digests
+          CANDIDATE_SHA: ${{ github.event.workflow_run.head_sha }}
+          TRIGGER_EVENT: ${{ github.event.workflow_run.event }}
+          TRIGGER_TAG: ${{ github.event.workflow_run.head_branch }}
+        run: |
+          python -I -S - <<'PY'
+          import os
+          import pathlib
+          import re
+
+          root = pathlib.Path(os.environ['DIGEST_ARTIFACT_DIR'])
+          expected_files = {
+              'pa2bridge-digest-amd64/amd64.txt',
+              'pa2bridge-digest-aarch64/aarch64.txt',
+          }
+          expected_directories = {
+              'pa2bridge-digest-amd64',
+              'pa2bridge-digest-aarch64',
+          }
+          entries = list(root.rglob('*')) if root.is_dir() and not root.is_symlink() else []
+          actual_files = {
+              path.relative_to(root).as_posix()
+              for path in entries
+              if path.is_file() and not path.is_symlink()
+          }
+          actual_directories = {
+              path.relative_to(root).as_posix()
+              for path in entries
+              if path.is_dir() and not path.is_symlink()
+          }
+          if (
+              actual_files != expected_files
+              or actual_directories != expected_directories
+              or len(entries) != len(expected_files) + len(expected_directories)
+              or any(path.is_symlink() for path in entries)
+          ):
+              raise SystemExit('unexpected digest artifact set')
+          digests = {}
+          for arch in ('amd64', 'aarch64'):
+              path = root / f'pa2bridge-digest-{arch}' / f'{arch}.txt'
+              value = path.read_text()
+              if re.fullmatch(r'sha256:[0-9a-f]{64}\n', value) is None:
+                  raise SystemExit(f'invalid {arch} digest artifact')
+              digests[arch] = value.strip()
+          if len(set(digests.values())) != len(digests):
+              raise SystemExit('architecture digests must be distinct')
+          PY
+          amd64_digest="$(cat /tmp/pa2bridge-image-digests/pa2bridge-digest-amd64/amd64.txt)"
+          aarch64_digest="$(cat /tmp/pa2bridge-image-digests/pa2bridge-digest-aarch64/aarch64.txt)"
+          test -n "${VERIFIED_REVIEWED_TREE_SHA256}"
+          test "${CURRENT_REVIEWED_TREE_SHA256}" = "${VERIFIED_REVIEWED_TREE_SHA256}"
+          test "${TRIGGER_EVENT}" = "push"
+          test "${TRIGGER_TAG}" = "v${VERSION}"
+          git fetch --force --no-tags origin "refs/tags/${TRIGGER_TAG}:refs/tags/${TRIGGER_TAG}"
+          tag_commit="$(git rev-parse "refs/tags/v${VERSION}^{commit}")"
+          test "${tag_commit}" = "${CANDIDATE_SHA}"
+          docker buildx imagetools create \
+            --tag "ghcr.io/gcs8/pa2bridge:${VERSION}" \
+            "ghcr.io/gcs8/pa2bridge@${amd64_digest}" \
+            "ghcr.io/gcs8/pa2bridge@${aarch64_digest}"

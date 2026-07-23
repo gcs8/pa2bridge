@@ -1,0 +1,27 @@
+# PA2 connection
+[pa2]
+host = "192.0.2.20"
+port = 19272
+username = "administrator"
+# Uses the PA2 factory default when omitted. For a changed password, use:
+# password_env = "PA2BRIDGE_PA2_PASSWORD"
+allowed_preset_slots = [1, 2]
+connect_timeout = 3.0
+# Maximum 20 seconds: preserves an MQTT keepalive safety margin.
+recall_timeout = 10.0
+poll_interval = 0.2
+post_recall_delay = 1.0
+
+# Home Assistant Mosquitto broker
+[mqtt]
+host = "homeassistant.local"
+port = 1883
+username_env = "PA2BRIDGE_MQTT_USERNAME"
+password_env = "PA2BRIDGE_MQTT_PASSWORD"
+base_topic = "driverack/pa2"
+discovery_prefix = "homeassistant"
+client_id = "pa2bridge"
+state_poll_interval = 5.0
+# Real meter values change constantly. Opt in only if useful, and consider
+# excluding them from HA Recorder or increasing state_poll_interval.
+expose_meters = false

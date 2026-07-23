@@ -1,0 +1,42 @@
+[project]
+name = "pa2bridge"
+version = "0.1.0"
+description = "DriveRack PA2 bridge for Home Assistant, MQTT, and Stream Deck"
+license = "MIT"
+requires-python = ">=3.11"
+dependencies = [
+  "paho-mqtt>=2.1,<3",
+]
+
+[project.scripts]
+pa2bridge = "pa2bridge.cli:main"
+pa2bridge-ha-app = "pa2bridge.ha_app:main"
+
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pa2bridge"]
+
+[dependency-groups]
+dev = [
+  "pytest>=8.3,<9",
+  "pytest-cov>=6,<7",
+  "pip-audit==2.10.1",
+  "ruff==0.12.12",
+]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.coverage.run]
+branch = true
+source = ["pa2bridge"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+fail_under = 85

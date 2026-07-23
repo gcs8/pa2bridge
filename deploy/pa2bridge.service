@@ -1,0 +1,24 @@
+[Unit]
+Description=dbx DriveRack PA2 MQTT/Home Assistant bridge
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/pa2bridge/pa2bridge.env
+ExecStart=%h/.local/bin/pa2bridge --config %h/.config/pa2bridge/config.toml daemon
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=10s
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=default.target

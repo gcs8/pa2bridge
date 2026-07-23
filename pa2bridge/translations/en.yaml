@@ -1,0 +1,40 @@
+configuration:
+  pa2_host:
+    name: DriveRack PA2 host
+    description: IPv4 address or resolvable hostname of the PA2.
+  pa2_port:
+    name: DriveRack PA2 port
+    description: HiQnet Console TCP port, normally 19272.
+  pa2_username:
+    name: PA2 username
+    description: Username used to authenticate to the PA2 Console.
+  pa2_password:
+    name: PA2 password
+    description: Password used to authenticate to the PA2 Console.
+  allowed_preset_slots:
+    name: Allowed preset slots
+    description: Only these inspected preset slots may be recalled.
+  connect_timeout:
+    name: Connection timeout
+    description: Maximum seconds for each PA2 network operation.
+  recall_timeout:
+    name: Recall confirmation timeout
+    description: Maximum seconds to reconnect and confirm a requested preset.
+  poll_interval:
+    name: Recall poll interval
+    description: Seconds between recall confirmation attempts.
+  post_recall_delay:
+    name: Post-recall delay
+    description: Seconds to wait before the final preset check and output unmute.
+  state_poll_interval:
+    name: State poll interval
+    description: Seconds between Home Assistant state refreshes.
+  expose_meters:
+    name: Expose input/output meters and input clips
+    description: Publish live input/output dBFS meters and input clip entities; disabled by default.
+  base_topic:
+    name: MQTT base topic
+    description: Unique MQTT topic namespace for this PA2.
+  discovery_prefix:
+    name: MQTT discovery prefix
+    description: Home Assistant MQTT Discovery prefix, normally homeassistant.

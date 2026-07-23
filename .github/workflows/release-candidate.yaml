@@ -1,0 +1,25 @@
+name: Release Candidate
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  signal:
+    name: Signal trusted release workflow
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Validate tag event shape
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          test "${REF_TYPE}" = "tag"
+          case "${REF_NAME}" in
+            v*) ;;
+            *) exit 1 ;;
+          esac

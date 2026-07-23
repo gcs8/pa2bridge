@@ -1,0 +1,44 @@
+name: PA2Bridge
+version: "0.1.0"
+slug: pa2bridge
+description: Safely control and monitor a dbx DriveRack PA2 through Home Assistant
+url: "https://github.com/gcs8/pa2bridge/tree/main/pa2bridge"
+arch:
+  - amd64
+  - aarch64
+init: false
+stage: experimental
+services:
+  - mqtt:need
+options:
+  pa2_host: null
+  pa2_port: 19272
+  pa2_username: administrator
+  pa2_password: null
+  allowed_preset_slots:
+    - 1
+    - 2
+  connect_timeout: 3.0
+  recall_timeout: 10.0
+  poll_interval: 0.2
+  post_recall_delay: 1.0
+  state_poll_interval: 5.0
+  expose_meters: false
+  base_topic: driverack/pa2
+  discovery_prefix: homeassistant
+schema:
+  pa2_host: str
+  pa2_port: port
+  pa2_username: str
+  pa2_password: password
+  allowed_preset_slots:
+    - "int(1,2)"
+  connect_timeout: "float(0.1,60)"
+  recall_timeout: "float(0.1,20)"
+  poll_interval: "float(0.01,10)"
+  post_recall_delay: "float(0,60)"
+  state_poll_interval: "float(0.1,3600)"
+  expose_meters: bool
+  base_topic: str
+  discovery_prefix: str
+image: ghcr.io/gcs8/pa2bridge
