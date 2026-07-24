@@ -243,6 +243,8 @@ def test_home_assistant_app_image_builds_the_reviewed_local_source() -> None:
         "FROM ghcr.io/home-assistant/base-python:3.14-alpine3.23-2026.06.1@sha256:"
     )
     assert "apk add" not in dockerfile
+    assert "apk upgrade --no-cache" in dockerfile
+    assert "rm /usr/bin/tempio" in dockerfile
     assert "COPY src /opt/pa2bridge/src" in dockerfile
     assert "COPY LICENSE /usr/share/licenses/pa2bridge/LICENSE" in dockerfile
     assert "--require-hashes" in dockerfile

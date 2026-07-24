@@ -3,6 +3,9 @@ FROM ghcr.io/home-assistant/base-python:3.14-alpine3.23-2026.06.1@sha256:66f223c
 ARG BUILD_VERSION=dev
 ARG BUILD_ARCH=amd64
 
+RUN apk upgrade --no-cache \
+    && rm /usr/bin/tempio
+
 RUN python3 -m venv /opt/pa2bridge
 
 COPY pa2bridge/requirements.txt /tmp/requirements.txt
