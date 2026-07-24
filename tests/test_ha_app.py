@@ -412,7 +412,60 @@ def test_release_workflow_uses_a_workflow_run_compatible_secret_scan() -> None:
     assert "GITLEAKS_VERSION: 8.30.1" in workflow
     assert "gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" in workflow
     assert "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb" in workflow
+    assert "sha256sum --check --strict" in workflow
+    assert "88f91962aa2f93ac6ab281d553b9e125f5197bbbce38f9f2437f7299c32e5509" in workflow
     assert "gitleaks dir --no-banner --redact ." in workflow
+
+
+def test_release_workflow_normalizes_the_helper_version_before_tag_checks(
+    tmp_path: Path,
+) -> None:
+    workflow = (PROJECT_ROOT / ".github" / "workflows" / "build-app.yaml").read_text()
+    step = workflow.split("- name: Normalize app version", 1)[1].split(
+        "- name: Verify release tag", 1
+    )[0]
+    block = step.split("python -I -S - <<'PY'\n", 1)[1].split("\n          PY", 1)[0]
+    script = "\n".join(
+        line[10:] if line.startswith("          ") else line
+        for line in block.splitlines()
+    )
+    output = tmp_path / "github-output"
+    environment = os.environ.copy()
+    environment.update({"RAW_VERSION": '"0.1.0"', "GITHUB_OUTPUT": str(output)})
+
+    result = subprocess.run(
+        [sys.executable, "-I", "-S", "-c", script],
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert output.read_text() == "version=0.1.0\n"
+
+    invalid_versions = (
+        '"01.2.3"',
+        '"1.2.3-01"',
+        '"1.2.3-alpha..1"',
+        f'"1.2.3-{"a" * 123}"',
+    )
+    for index, raw_version in enumerate(invalid_versions):
+        invalid_output = tmp_path / f"invalid-output-{index}"
+        invalid_environment = os.environ.copy()
+        invalid_environment.update(
+            {"RAW_VERSION": raw_version, "GITHUB_OUTPUT": str(invalid_output)}
+        )
+        invalid = subprocess.run(
+            [sys.executable, "-I", "-S", "-c", script],
+            env=invalid_environment,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        assert invalid.returncode != 0
+        assert not invalid_output.exists()
 
 
 def test_final_publication_gate_refetches_and_rejects_a_moved_tag(
