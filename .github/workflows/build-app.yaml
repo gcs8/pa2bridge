@@ -122,7 +122,7 @@ jobs:
     if: github.repository == 'gcs8/pa2bridge'
     runs-on: ubuntu-24.04
     outputs:
-      version: ${{ steps.info.outputs.version }}
+      version: ${{ steps.version.outputs.version }}
     steps:
       - name: Check out repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -135,12 +135,40 @@ jobs:
         uses: home-assistant/actions/helpers/info@e3fb68ebda13d88a0d695082f471ba2c83d025fb
         with:
           path: ./pa2bridge
+      - name: Normalize app version
+        id: version
+        env:
+          RAW_VERSION: ${{ steps.info.outputs.version }}
+        run: |
+          python -I -S - <<'PY'
+          import json
+          import os
+          import pathlib
+          import re
+
+          raw = os.environ['RAW_VERSION']
+          version = json.loads(raw) if raw.startswith('"') else raw
+          numeric = r'(?:0|[1-9][0-9]*)'
+          prerelease = r'(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)'
+          semver = re.compile(
+              rf'{numeric}\.{numeric}\.{numeric}'
+              rf'(?:-{prerelease}(?:\.{prerelease})*)?'
+          )
+          if (
+              not isinstance(version, str)
+              or len(version) > 128
+              or semver.fullmatch(version) is None
+          ):
+              raise SystemExit('invalid app version')
+          with pathlib.Path(os.environ['GITHUB_OUTPUT']).open('a') as output:
+              output.write(f'version={version}\n')
+          PY
       - name: Verify release tag matches app version and candidate commit
         env:
           CANDIDATE_SHA: ${{ github.event.workflow_run.head_sha }}
           TRIGGER_EVENT: ${{ github.event.workflow_run.event }}
           TRIGGER_TAG: ${{ github.event.workflow_run.head_branch }}
-          VERSION: ${{ steps.info.outputs.version }}
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
           test "${TRIGGER_EVENT}" = "push"
           test "${TRIGGER_TAG}" = "v${VERSION}"
