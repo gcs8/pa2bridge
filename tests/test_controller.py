@@ -1326,7 +1326,7 @@ def test_preset_catalog_rejects_unobserved_auxiliary_key() -> None:
 
     controller = Pa2Controller(UnknownCatalogKeyClient(), allowed_slots=None)
 
-    with pytest.raises(TelemetryError, match="unexpected key"):
+    with pytest.raises(TelemetryError, match="UnobservedField"):
         controller.list_all_presets()
 
 
@@ -1557,6 +1557,34 @@ def test_crossover_telemetry_contains_curve_parameters_for_every_reported_band()
     assert client.sets == []
 
 
+def test_crossover_accepts_observed_pa2_topology_auxiliary_keys() -> None:
+    client = TelemetryClient()
+    original_ls = client.ls
+
+    def observed_ls(path: Iterable[str]) -> dict[str, str]:
+        attributes = original_ls(path)
+        if tuple(path) == ("Preset", "Crossover", "AT"):
+            attributes.update(
+                {
+                    "Class_Name": "ignored",
+                    "Flags": "ignored",
+                    "Instance_Name": "ignored",
+                    "NumSlots": "ignored",
+                }
+            )
+        return attributes
+
+    client.ls = observed_ls  # type: ignore[method-assign]
+    controller = Pa2Controller(client, allowed_slots=(1, 2))
+
+    crossover = controller.crossover()
+
+    assert crossover.num_bands == 1
+    assert crossover.mono_sub is True
+    assert [band.identifier for band in crossover.bands] == ["Band_1", "MonoSub"]
+    assert client.sets == []
+
+
 def test_crossover_rejects_topology_with_missing_reported_bands() -> None:
     client = TelemetryClient()
 
@@ -1716,4 +1744,21 @@ def test_crossover_rejects_malformed_or_unknown_topology_metadata(
     controller = Pa2Controller(client, allowed_slots=(1, 2))
 
     with pytest.raises(TelemetryError):
+        controller.crossover()
+
+
+def test_crossover_names_unobserved_topology_key_in_error() -> None:
+    client = TelemetryClient()
+    original_ls = client.ls
+
+    def topology_ls(path: Iterable[str]) -> dict[str, str]:
+        attributes = original_ls(path)
+        if tuple(path) == ("Preset", "Crossover", "AT"):
+            attributes["FutureField"] = "surprise"
+        return attributes
+
+    client.ls = topology_ls  # type: ignore[method-assign]
+    controller = Pa2Controller(client, allowed_slots=(1, 2))
+
+    with pytest.raises(TelemetryError, match="FutureField"):
         controller.crossover()

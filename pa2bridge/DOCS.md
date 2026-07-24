@@ -11,7 +11,7 @@ PA2Bridge provides a single supervised connection from Home Assistant to a dbx D
 
 ## Upgrading from 0.1.1
 
-Version 0.1.2 is a manual update because it replaces option fields that Supervisor cannot migrate in place. Leave `pa2_password_override` blank when the PA2 still uses its factory password; otherwise re-enter the PA2's custom password there before starting the updated app. Leave `preset_slots` at `auto` unless you want an explicit comma-separated restriction. A legacy `allowed_preset_slots` compatibility field may remain visible after the update; do not edit it.
+Version 0.1.2 is a manual update because it replaces option fields that Supervisor cannot migrate in place. Leave `pa2_password_override` blank when the PA2 still uses its factory password; otherwise re-enter the PA2's custom password there before starting the updated app. A retained restrictive `allowed_preset_slots` value remains the active narrower restriction while `preset_slots` is `auto`. If both fields are set to explicit restrictions, they must contain the same slot set; differing restrictive values fail closed instead of widening recall access.
 
 ## Safety behavior
 
@@ -23,7 +23,7 @@ Preset recall starts one finite absolute deadline at public entry, validates the
 - `pa2_port`: PA2 Console TCP port; normally `19272`.
 - `pa2_username` and `pa2_password_override`: PA2 Console credentials. A blank password override uses the factory default, `administrator`.
 - `preset_slots`: `auto` publishes every named preset reported by the device. A comma-separated set of unique slots from `1` through `100` narrows recall to those slots.
-- `allowed_preset_slots`: legacy v0.1.1 compatibility field. Do not edit it after upgrading; use `preset_slots` instead.
+- `allowed_preset_slots`: legacy v0.1.1 compatibility field. A retained list narrows `preset_slots: auto`; when both fields are explicit, keep their slot sets equivalent.
 - `connect_timeout`, `recall_timeout`, `poll_interval`, and `post_recall_delay`: bounded safety timing controls. `recall_timeout` is limited to 20 seconds so a PA2 transaction cannot consume the bridge's 30-second MQTT keepalive interval while broker-session authorization is held.
 - `state_poll_interval`: PA2 state refresh interval.
 - `expose_meters`: publish two input and six output dBFS meters plus two input clip diagnostics; disabled by default.

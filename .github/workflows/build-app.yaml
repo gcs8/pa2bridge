@@ -121,6 +121,9 @@ jobs:
     needs: verify
     if: github.repository == 'gcs8/pa2bridge'
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: read
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
@@ -175,6 +178,11 @@ jobs:
           git fetch --force --no-tags origin "refs/tags/${TRIGGER_TAG}:refs/tags/${TRIGGER_TAG}"
           tag_commit="$(git rev-parse "refs/tags/v${VERSION}^{commit}")"
           test "${tag_commit}" = "${CANDIDATE_SHA}"
+      - name: Reject an existing immutable image version
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: python -I -S scripts/assert_ghcr_tag_absent.py "gcs8/pa2bridge" "${VERSION}"
   build:
     name: Build, scan, and publish ${{ matrix.arch }} image
     needs:
@@ -319,6 +327,7 @@ jobs:
           merge-multiple: false
       - name: Publish manifest
         env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ needs.prepare.outputs.version }}
           VERIFIED_REVIEWED_TREE_SHA256: ${{ needs.verify.outputs.reviewed_identity }}
           CURRENT_REVIEWED_TREE_SHA256: ${{ vars.REVIEWED_TREE_SHA256 }}
@@ -378,6 +387,7 @@ jobs:
           git fetch --force --no-tags origin "refs/tags/${TRIGGER_TAG}:refs/tags/${TRIGGER_TAG}"
           tag_commit="$(git rev-parse "refs/tags/v${VERSION}^{commit}")"
           test "${tag_commit}" = "${CANDIDATE_SHA}"
+          python -I -S scripts/assert_ghcr_tag_absent.py "gcs8/pa2bridge" "${VERSION}"
           docker buildx imagetools create \
             --tag "ghcr.io/gcs8/pa2bridge:${VERSION}" \
             "ghcr.io/gcs8/pa2bridge@${amd64_digest}" \

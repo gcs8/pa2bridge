@@ -14,6 +14,7 @@ from typing import Iterable
 
 _VALUE_RE = re.compile(r'^(?P<kind>get|set|setr|subr) "(?P<path>[^"]+)" "(?P<value>[^"]*)"$')
 _ERROR_RE = re.compile(r'^error "(?P<message>[^"]*)"$')
+_MAX_RESPONSE_LINE_BYTES = 64 * 1024
 
 
 class ProtocolError(RuntimeError):
@@ -316,9 +317,12 @@ class HiQnetClient:
                     entries[key] = value
 
     def _read_response_line(self, deadline: float) -> str:
-        """Read a response while tolerating exact delayed set echoes."""
+        """Read a response while tolerating exact delayed set acknowledgements."""
         line = self._read_line(deadline)
-        while self._pending_set_echoes and line == self._pending_set_echoes[0]:
+        while self._pending_set_echoes:
+            pending = self._pending_set_echoes[0]
+            if line not in {pending, "setr" + pending[3:]}:
+                break
             self._pending_set_echoes.popleft()
             line = self._read_line(deadline)
         if self._pending_set_echoes:
@@ -358,8 +362,19 @@ class HiQnetClient:
     def _read_line(self, deadline: float, *, allow_tab: bool = False) -> str:
         while True:
             self._require_before_deadline(deadline)
-            if b"\n" in self._buffer:
+            newline = self._buffer.find(b"\n")
+            if newline >= 0:
+                if newline > _MAX_RESPONSE_LINE_BYTES:
+                    self.close()
+                    raise MalformedFrameError(
+                        "PA2 response exceeded maximum frame size"
+                    )
                 break
+            if len(self._buffer) > _MAX_RESPONSE_LINE_BYTES:
+                self.close()
+                raise MalformedFrameError(
+                    "PA2 response exceeded maximum frame size"
+                )
             if self._socket is None:
                 raise ProtocolError("PA2 session is not connected")
             remaining = deadline - time.monotonic()
@@ -382,8 +397,8 @@ class HiQnetClient:
             self._buffer.extend(chunk)
 
         self._require_before_deadline(deadline)
-        raw, _, remainder = self._buffer.partition(b"\n")
-        self._buffer[:] = remainder
+        raw = bytes(self._buffer[:newline])
+        del self._buffer[: newline + 1]
         if raw.endswith(b"\r"):
             raw = raw[:-1]
         try:

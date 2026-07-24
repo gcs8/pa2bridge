@@ -110,7 +110,7 @@ def test_load_ha_app_config_accepts_v011_legacy_options(tmp_path: Path) -> None:
     assert "legacy-pa2-secret" not in repr(config)
 
 
-def test_load_ha_app_config_accepts_supervisor_merged_v011_defaults(
+def test_load_ha_app_config_uses_narrower_legacy_list_with_merged_auto_default(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "options.json"
@@ -125,8 +125,40 @@ def test_load_ha_app_config_accepts_supervisor_merged_v011_defaults(
 
     config = load_ha_app_config(path, environ=MQTT_ENV)
 
-    assert config.pa2.password == "administrator"
-    assert config.pa2.allowed_preset_slots is None
+    assert config.pa2.allowed_preset_slots == (1, 2)
+
+
+def test_load_ha_app_config_accepts_matching_canonical_and_legacy_allowlists(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "options.json"
+    _write_options(
+        path,
+        _options(
+            preset_slots="1, 2",
+            allowed_preset_slots=[2, 1],
+        ),
+    )
+
+    config = load_ha_app_config(path, environ=MQTT_ENV)
+
+    assert config.pa2.allowed_preset_slots == (1, 2)
+
+
+def test_load_ha_app_config_rejects_different_restrictive_allowlists(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "options.json"
+    _write_options(
+        path,
+        _options(
+            preset_slots="1, 2",
+            allowed_preset_slots=[1, 3],
+        ),
+    )
+
+    with pytest.raises(ConfigError, match="preset_slots conflicts with allowed_preset_slots"):
+        load_ha_app_config(path, environ=MQTT_ENV)
 
 
 def test_load_ha_app_config_rejects_non_network_pa2_host(tmp_path: Path) -> None:
@@ -448,11 +480,21 @@ def test_release_workflow_rejects_unexpected_digest_artifacts(tmp_path: Path) ->
 
 def test_project_package_and_app_versions_match() -> None:
     project = tomllib.loads((PROJECT_ROOT / "pyproject.toml").read_text())
+    lock = tomllib.loads((PROJECT_ROOT / "uv.lock").read_text())
     app_config = (PROJECT_ROOT / "pa2bridge" / "config.yaml").read_text()
     app_version = re.search(r'^version: "([^"]+)"$', app_config, re.MULTILINE)
+    locked_project = [
+        package for package in lock["package"] if package["name"] == "pa2bridge"
+    ]
 
     assert app_version is not None
-    assert project["project"]["version"] == app_version.group(1) == __version__
+    assert len(locked_project) == 1
+    assert (
+        project["project"]["version"]
+        == app_version.group(1)
+        == locked_project[0]["version"]
+        == __version__
+    )
 
 
 def test_release_workflow_binds_triggering_tag_to_app_version() -> None:
@@ -550,7 +592,9 @@ def test_final_publication_gate_refetches_and_rejects_a_moved_tag(
     publish_job = workflow.split("- name: Publish manifest", 1)[1]
     final_gate = publish_job.split(
         '          test -n "${VERIFIED_REVIEWED_TREE_SHA256}"', 1
-    )[1].split("          docker buildx imagetools create", 1)[0]
+    )[1].split(
+        "          python -I -S scripts/assert_ghcr_tag_absent.py", 1
+    )[0]
     script = 'test -n "${VERIFIED_REVIEWED_TREE_SHA256}"\n' + "\n".join(
         line[10:] if line.startswith("          ") else line
         for line in final_gate.splitlines()

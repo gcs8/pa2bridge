@@ -243,6 +243,7 @@ def test_connect_builds_discovery_and_on_connect_publishes_and_subscribes(monkey
 
     bridge._connect_pa2()
     bridge._on_connect(client, None, None, mqtt.ReasonCode(mqtt.PacketTypes.CONNACK, "Success"), None)
+    bridge._on_subscribe(client, None, client.subscribe_mid, [0], None)
     bridge._poll_once()
 
     assert pa2.connect_args == ("administrator", "pa2-secret")
@@ -295,6 +296,7 @@ def test_connect_callback_survives_pa2_failure_and_publishes_offline(monkeypatch
 
     controller.state = unavailable
     bridge._on_connect(client, None, None, 0, None)
+    bridge._on_subscribe(client, None, client.subscribe_mid, [0], None)
     with pytest.raises(OSError, match="PA2 unavailable"):
         bridge._poll_once()
 
@@ -333,7 +335,7 @@ def test_command_queued_before_disconnect_is_discarded_and_pa2_closed(monkeypatc
 
     bridge._on_disconnect(client, None, None, 1, None)
 
-    assert bridge._process_queued_command() is True
+    assert bridge._process_queued_command() is False
     assert controller.activations == []
     assert pa2.closed == 1
 
@@ -517,10 +519,10 @@ def test_mqtt_client_uses_bounded_outgoing_queues(monkeypatch) -> None:
 
     assert client.max_queued_messages == 100
     assert client.max_inflight_messages == 20
-    assert client.reconnect_delays is None
+    assert client.reconnect_delays == (1, 30)
 
 
-def test_mqtt_client_disables_automatic_reconnect(monkeypatch) -> None:
+def test_mqtt_client_enables_automatic_reconnect(monkeypatch) -> None:
     bridge, _, _, _ = make_bridge(monkeypatch)
     captured: dict[str, object] = {}
 
@@ -531,24 +533,114 @@ def test_mqtt_client_disables_automatic_reconnect(monkeypatch) -> None:
     monkeypatch.setattr(mqtt, "Client", client_factory)
     MqttBridge(bridge.config)
 
-    assert captured["reconnect_on_failure"] is False
+    assert captured["reconnect_on_failure"] is True
 
 
-def test_disconnect_marks_process_for_immediate_fresh_client_restart(monkeypatch) -> None:
-    bridge, client, _, _ = make_bridge(monkeypatch)
+def test_disconnect_invalidates_sessions_and_waits_for_fresh_subscription(monkeypatch) -> None:
+    bridge, client, pa2, controller = make_bridge(monkeypatch)
+    bridge._details_valid = True
+    bridge._discovery_published = True
+    bridge._on_message(
+        None,
+        None,
+        message("driverack/pa2/command/preset", "2: Alternate"),
+    )
+    generation = bridge._mqtt_generation
 
     bridge._on_disconnect(client, None, None, 7, None)
 
     assert bridge._mqtt_connected is False
-    assert bridge._mqtt_failure is not None
-    assert bridge._stop_event.is_set()
+    assert bridge._mqtt_failure is None
+    assert bridge._mqtt_generation == generation + 1
+    assert not bridge._stop_event.is_set()
+    assert bridge._mqtt_state_changed.is_set()
+    assert bridge._details_valid is False
+    assert bridge._discovery_published is False
+    assert pa2.closed >= 1
+    assert bridge._process_queued_command() is False
+    assert controller.activations == []
+    assert client.disconnected == 0
 
-    before = list(client.published)
     bridge._on_connect(client, None, None, 0, None)
-    bridge._publish("driverack/pa2/status", "online", retain=True)
     assert bridge._mqtt_connected is False
-    assert client.published == before
-    assert client.disconnected >= 1
+    bridge._on_subscribe(client, None, client.subscribe_mid, [0], None)
+    assert bridge._mqtt_connected is True
+    bridge._publish("driverack/pa2/status", "online", retain=True)
+    assert ("driverack/pa2/status", "online", 1, True) in client.published
+
+
+def test_disconnect_before_suback_keeps_startup_gate_closed(monkeypatch) -> None:
+    bridge, client, _, _ = make_bridge(monkeypatch)
+
+    bridge._on_connect(client, None, None, 0, None)
+    assert bridge._mqtt_ready.is_set() is False
+
+    bridge._on_disconnect(client, None, None, 7, None)
+
+    assert bridge._mqtt_failure is None
+    assert bridge._mqtt_connected is False
+    assert bridge._mqtt_ready.is_set() is False
+
+    bridge._on_connect(client, None, None, 0, None)
+    bridge._on_subscribe(client, None, client.subscribe_mid, [0], None)
+    assert bridge._mqtt_ready.is_set() is True
+    assert bridge._mqtt_connected is True
+
+
+def test_startup_gate_recovers_from_disconnect_before_suback(monkeypatch) -> None:
+    bridge, client, _, _ = make_bridge(monkeypatch)
+
+    def reconnect_and_subscribe() -> None:
+        assert client.on_connect is not None
+        assert client.on_subscribe is not None
+        client.on_connect(client, None, None, 0, None)
+        client.on_subscribe(client, None, client.subscribe_mid, [0], None)
+        bridge._stop_event.set()
+
+    def disconnecting_loop_start() -> None:
+        client.loop_started += 1
+        assert client.on_connect is not None
+        assert client.on_disconnect is not None
+        client.on_connect(client, None, None, 0, None)
+        client.on_disconnect(client, None, None, 7, None)
+        threading.Timer(0.01, reconnect_and_subscribe).start()
+
+    client.loop_start = disconnecting_loop_start  # type: ignore[method-assign]
+
+    bridge.run_forever()
+
+    assert client.loop_started == 1
+    assert client.loop_stopped == 1
+    assert bridge._mqtt_generation == 1
+
+
+def test_startup_gate_allows_transient_disconnect_after_suback(monkeypatch) -> None:
+    bridge, client, _, _ = make_bridge(monkeypatch)
+
+    def reconnect_after_startup_disconnect() -> None:
+        assert client.on_connect is not None
+        assert client.on_subscribe is not None
+        client.on_connect(client, None, None, 0, None)
+        client.on_subscribe(client, None, client.subscribe_mid, [0], None)
+        bridge._stop_event.set()
+
+    def disconnecting_loop_start() -> None:
+        client.loop_started += 1
+        assert client.on_connect is not None
+        assert client.on_subscribe is not None
+        assert client.on_disconnect is not None
+        client.on_connect(client, None, None, 0, None)
+        client.on_subscribe(client, None, client.subscribe_mid, [0], None)
+        client.on_disconnect(client, None, None, 7, None)
+        threading.Timer(0.01, reconnect_after_startup_disconnect).start()
+
+    client.loop_start = disconnecting_loop_start  # type: ignore[method-assign]
+
+    bridge.run_forever()
+
+    assert client.loop_started == 1
+    assert client.loop_stopped == 1
+    assert bridge._mqtt_generation == 1
 
 
 def test_failed_subscribe_result_never_marks_mqtt_ready(monkeypatch) -> None:
@@ -779,6 +871,66 @@ def test_periodic_detail_refresh_marks_details_offline_before_refresh(monkeypatc
     )
     online_index = events.index(("driverack/pa2/status/details", "online"))
     assert offline_index < crossover_index < online_index
+
+
+def test_detail_refresh_republishes_discovery_when_allowed_preset_labels_change(
+    monkeypatch,
+) -> None:
+    bridge, client, _, controller = make_bridge(monkeypatch)
+    bridge._connect_pa2()
+    bridge._discovery_published = True
+    client.published.clear()
+    controller.presets = [Preset(1, "Renamed"), Preset(2, "Alternate")]
+    controller.all_presets = [*controller.presets, Preset(3, "Factory")]
+
+    bridge.publish_details()
+
+    select_payloads = [
+        json.loads(payload)
+        for topic, payload, *_ in client.published
+        if topic.startswith("homeassistant/select/")
+    ]
+    assert len(select_payloads) == 1
+    assert select_payloads[0]["options"] == ["1: Renamed", "2: Alternate"]
+    assert bridge._preset_commands == frozenset({"1: Renamed", "2: Alternate"})
+
+
+def test_failed_discovery_refresh_does_not_authorize_changed_preset_labels(
+    monkeypatch,
+) -> None:
+    bridge, _, _, controller = make_bridge(monkeypatch)
+    bridge._connect_pa2()
+    bridge._discovery_published = True
+    old_commands = bridge._preset_commands
+    controller.presets = [Preset(1, "Renamed"), Preset(2, "Alternate")]
+    controller.all_presets = [*controller.presets, Preset(3, "Factory")]
+    original_publish = bridge._publish
+
+    def fail_select_discovery(topic: str, payload: str, *, retain: bool):
+        if topic.startswith("homeassistant/select/"):
+            raise MqttPublishError("discovery publish failed")
+        return original_publish(topic, payload, retain=retain)
+
+    monkeypatch.setattr(bridge, "_publish", fail_select_discovery)
+
+    with pytest.raises(MqttPublishError, match="discovery publish failed"):
+        bridge.publish_details()
+
+    assert bridge._preset_commands == old_commands
+    assert "1: Renamed" not in bridge._preset_commands
+
+
+def test_detail_refresh_does_not_republish_unchanged_discovery(monkeypatch) -> None:
+    bridge, client, _, _ = make_bridge(monkeypatch)
+    bridge._connect_pa2()
+    bridge._discovery_published = True
+    client.published.clear()
+
+    bridge.publish_details()
+
+    assert not any(
+        topic.startswith("homeassistant/") for topic, *_ in client.published
+    )
 
 
 def test_meter_collection_failure_never_publishes_online(monkeypatch) -> None:
