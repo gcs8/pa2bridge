@@ -76,7 +76,7 @@ Each mute state uses `On` for muted and `Off` for unmuted:
 \\Preset\OutputGains\SV\LowRightOutputMute
 ```
 
-PA2Bridge writes all requested values and then performs a `get` on every path. It reports success only when every readback matches.
+PA2 firmware can stop servicing the Console and freeze front-panel telemetry when several output writes are sent as a burst. PA2Bridge therefore writes one output, immediately reads that same path back, and applies bounded inter-channel pacing before writing the next output. It then performs a final `get` on every path and reports success only when every readback matches. A failed immediate readback prevents the next normal output write.
 
 ## Output meter telemetry
 

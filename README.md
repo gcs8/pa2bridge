@@ -17,7 +17,7 @@ The intended Stream Deck path is **Stream Deck → Home Assistant plugin → HA 
 
 ## Validation status
 
-The Console transport, preset discovery/recall behavior, six output mute paths, and six output meter paths have been exercised against a physical DriveRack PA2 running firmware `1.2.0.1`. Preset loading can terminate or stall the active Console session, so recall confirmation always uses a bounded reconnect path before any unmute.
+The Console transport, preset discovery/recall behavior, six output mute paths, and six output meter paths have been exercised against a physical DriveRack PA2 running firmware `1.2.0.1`. Preset loading can terminate or stall the active Console session, so recall confirmation always uses a bounded reconnect path before any unmute. All-output transitions are serialized as write, immediate same-channel readback, and bounded pacing because burst writes can wedge the PA2 Console and front-panel telemetry.
 
 Before migrating from the standalone service to the Home Assistant App, stop the standalone service and verify that no other PA2 client is connected. Never run both deployment models concurrently.
 
@@ -36,7 +36,7 @@ The supported architecture is therefore **Home Assistant App → MQTT Discovery 
 Preset activation is deliberately ordered:
 
 1. Start one finite absolute activation deadline, then resolve the requested preset against a fresh device-reported catalog. Automatic mode accepts every named slot reported by the PA2; an optional explicit allowlist can narrow that catalog to unique slots `1`–`100`.
-2. Set all six output mutes to `On` and verify all six readbacks. Abort before recall if any value is unknown or not muted.
+2. Set each output mute to `On`, immediately verify that same channel, and pace before writing the next output; then verify all six readbacks together. Abort before recall if any value is unknown or not muted.
 3. Write the PA2 `Recall` value only when the target differs from the current slot. The original entry deadline applies to catalog resolution, preflight muting, identity/current reads, recall, and the already-active path without reset.
 4. Poll `CurrentPreset` until the target slot is confirmed, reconnecting the console within the same bounded deadline if preset loading drops or stalls the original session.
 5. If confirmation times out, stop with all outputs muted; **do not unmute**.

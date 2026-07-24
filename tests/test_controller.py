@@ -253,6 +253,68 @@ def test_activate_preset_waits_for_recall_then_unmutes_and_verifies_every_output
     assert 0.75 in clock.sleeps
 
 
+def test_all_output_writes_are_individually_verified_and_paced() -> None:
+    class OrderedClient(FakeClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.output_events: list[tuple[str, tuple[str, ...]]] = []
+
+        def set(self, path: Iterable[str], value: str) -> None:
+            key = tuple(path)
+            if key in OUTPUT_MUTES.values():
+                self.output_events.append(("set", key))
+            super().set(key, value)
+
+        def get(self, path: Iterable[str]) -> str:
+            key = tuple(path)
+            if key in OUTPUT_MUTES.values():
+                self.output_events.append(("get", key))
+            return super().get(key)
+
+    client = OrderedClient()
+    sleeps: list[float] = []
+    controller = Pa2Controller(
+        client,
+        allowed_slots=(1, 2),
+        sleep=sleeps.append,
+    )
+
+    controller.set_all_outputs_muted(True)
+
+    paths = list(OUTPUT_MUTES.values())
+    assert client.output_events[: 2 * len(paths)] == [
+        event
+        for path in paths
+        for event in (("set", path), ("get", path))
+    ]
+    assert sleeps == [0.2] * (len(paths) - 1)
+
+
+def test_all_output_writes_stop_before_next_channel_when_readback_fails() -> None:
+    failed_path = OUTPUT_MUTES["high_right"]
+
+    class RefusesSecondMuteClient(FakeClient):
+        def get(self, path: Iterable[str]) -> str:
+            if tuple(path) == failed_path:
+                return "Off"
+            return super().get(path)
+
+    client = RefusesSecondMuteClient()
+    controller = Pa2Controller(
+        client,
+        allowed_slots=(1, 2),
+        sleep=lambda _: None,
+    )
+
+    with pytest.raises(OutputVerificationError, match="high_right"):
+        controller._write_all_outputs("On")
+
+    assert client.sets == [
+        (OUTPUT_MUTES["high_left"], "On"),
+        (OUTPUT_MUTES["high_right"], "On"),
+    ]
+
+
 def test_preset_is_rechecked_after_post_recall_delay_before_unmute() -> None:
     client = FakeClient(current=1)
 
@@ -300,7 +362,7 @@ def test_recall_deadline_expiring_during_post_delay_never_unmutes() -> None:
     controller = Pa2Controller(
         client,
         allowed_slots=(1, 2),
-        recall_timeout=1.0,
+        recall_timeout=2.0,
         post_recall_delay=2.0,
         sleep=clock.sleep,
         monotonic=clock.monotonic,
@@ -340,8 +402,8 @@ def test_recall_deadline_stops_without_extending_for_rollback() -> None:
     controller = Pa2Controller(
         client,
         allowed_slots=(1, 2),
-        recall_timeout=1.0,
-        post_recall_delay=0.9,
+        recall_timeout=3.0,
+        post_recall_delay=1.9,
         sleep=clock.sleep,
         monotonic=clock.monotonic,
     )
@@ -349,7 +411,7 @@ def test_recall_deadline_stops_without_extending_for_rollback() -> None:
     with pytest.raises(OutputVerificationError, match="rollback deadline expired"):
         controller.activate_preset(2)
 
-    assert client.unmute_starts == [0.9]
+    assert client.unmute_starts == [2.9]
     assert client.mutes[OUTPUT_MUTES["high_left"]] == "Off"
     assert client.sets.count((OUTPUT_MUTES["high_left"], "On")) == 1
 
@@ -606,7 +668,7 @@ def test_recall_stops_immediately_when_reconnect_crosses_deadline() -> None:
     controller = Pa2Controller(
         client,
         allowed_slots=(1, 2),
-        recall_timeout=1.0,
+        recall_timeout=2.0,
         poll_interval=0.25,
         sleep=clock.sleep,
         monotonic=clock.monotonic,
@@ -616,7 +678,7 @@ def test_recall_stops_immediately_when_reconnect_crosses_deadline() -> None:
         controller.activate_preset(2)
 
     assert client.recall_reads == 1
-    assert clock.sleeps == []
+    assert clock.sleeps == [0.2] * 5
     assert all(value == "On" for value in client.mutes.values())
 
 

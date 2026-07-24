@@ -66,6 +66,7 @@ _FREQUENCY_PATTERN = re.compile(
     r"((?:0|[1-9][0-9]*)(?:\.[0-9]+)?)(?:(k)?Hz)?", re.IGNORECASE | re.ASCII
 )
 _ASCII_UNSIGNED_INTEGER = re.compile(r"(?:0|[1-9][0-9]*)", re.ASCII)
+_OUTPUT_WRITE_PACE_SECONDS = 0.2
 _FILTER_TYPES = {
     "BW 6",
     "BW 12",
@@ -668,12 +669,24 @@ class Pa2Controller:
         *,
         deadline: float | None = None,
     ) -> dict[str, bool]:
-        for path in OUTPUT_MUTES.values():
+        expected_muted = expected == "On"
+        ordered = tuple(OUTPUT_MUTES.items())
+        for index, (channel, path) in enumerate(ordered):
             self._require_unmute_before(deadline)
             self._client_set(path, expected, deadline=deadline)
             self._require_unmute_before(deadline)
+            actual = _parse_output_mute(
+                channel,
+                self._client_get(path, deadline=deadline),
+            )
+            self._require_unmute_before(deadline)
+            if actual != expected_muted:
+                raise OutputVerificationError(
+                    f"{channel} readback did not confirm {expected!r}"
+                )
+            if index < len(ordered) - 1:
+                self._pace_output_transition(deadline=deadline)
         readback = self._read_all_output_mutes(deadline=deadline)
-        expected_muted = expected == "On"
         mismatches = [
             channel for channel, value in readback.items() if value != expected_muted
         ]
@@ -797,6 +810,15 @@ class Pa2Controller:
             raise RollbackDeadlineError(
                 f"rollback deadline expired before {action}; output mute state is unsafe or unknown"
             )
+
+    def _pace_output_transition(
+        self,
+        *,
+        deadline: float | None,
+    ) -> None:
+        self._require_unmute_before(deadline)
+        self._sleep(_OUTPUT_WRITE_PACE_SECONDS)
+        self._require_unmute_before(deadline)
 
     def set_all_outputs_muted(
         self,
