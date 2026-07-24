@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.1
+
+- Initial public Home Assistant App release.
+- Upgrade fixed Alpine packages during the image build.
+- Remove the unused inherited `tempio` binary and its unreachable vulnerable Go dependencies.
+
 ## 0.1.0
 
 - Initial experimental Home Assistant App package.
