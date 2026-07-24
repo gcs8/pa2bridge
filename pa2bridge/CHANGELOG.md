@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.3
+
+- Accept PA2 preset catalogs that omit optional `NumPresets` or embedded `CurrentPreset` metadata while continuing to require a contiguous device-reported slot range from 1 through 100.
+- Preserve fail-closed preset verification by bracketing metadata-light catalog reads with bounded direct `CurrentPreset` checks.
+
 ## 0.1.2
 
 - Default a blank or omitted PA2 password to the factory administrator password.

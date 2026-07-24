@@ -1273,6 +1273,80 @@ def test_current_preset_rejects_conflicting_direct_and_catalog_values() -> None:
         controller.current_preset()
 
 
+def test_preset_catalog_accepts_contiguous_names_when_metadata_is_omitted() -> None:
+    class NamesOnlyCatalogClient(FakeClient):
+        def ls(self, path: Iterable[str]) -> dict[str, str]:
+            catalog = super().ls(path)
+            catalog.pop("NumPresets")
+            catalog.pop("CurrentPreset")
+            return catalog
+
+    controller = Pa2Controller(NamesOnlyCatalogClient(), allowed_slots=None)
+
+    assert [preset.slot for preset in controller.list_all_presets()] == [1, 2, 3]
+
+
+def test_current_preset_brackets_catalog_without_embedded_current_read() -> None:
+    class CatalogWithoutCurrentClient(FakeClient):
+        def __init__(self) -> None:
+            super().__init__(current=2)
+            self.current_reads = 0
+
+        def get(self, path: Iterable[str]) -> str:
+            if tuple(path) == CURRENT_PRESET:
+                self.current_reads += 1
+            return super().get(path)
+
+        def ls(self, path: Iterable[str]) -> dict[str, str]:
+            catalog = super().ls(path)
+            catalog.pop("CurrentPreset")
+            return catalog
+
+    client = CatalogWithoutCurrentClient()
+    controller = Pa2Controller(client, allowed_slots=None)
+
+    assert controller.current_preset().slot == 2
+    assert client.current_reads == 2
+
+
+def test_current_preset_fails_closed_if_direct_value_changes_around_catalog() -> None:
+    class ChangingCurrentClient(FakeClient):
+        def __init__(self) -> None:
+            super().__init__(current=1)
+            self.current_reads = 0
+
+        def get(self, path: Iterable[str]) -> str:
+            if tuple(path) == CURRENT_PRESET:
+                self.current_reads += 1
+                if self.current_reads == 2:
+                    self.current = 2
+            return super().get(path)
+
+        def ls(self, path: Iterable[str]) -> dict[str, str]:
+            catalog = super().ls(path)
+            catalog.pop("CurrentPreset")
+            return catalog
+
+    controller = Pa2Controller(ChangingCurrentClient(), allowed_slots=None)
+
+    with pytest.raises(TelemetryError, match="conflicting CurrentPreset"):
+        controller.current_preset()
+
+
+def test_inferred_preset_catalog_rejects_noncontiguous_name_slots() -> None:
+    class GappedCatalogClient(FakeClient):
+        def ls(self, path: Iterable[str]) -> dict[str, str]:
+            catalog = super().ls(path)
+            catalog.pop("NumPresets")
+            catalog.pop("Name_2")
+            return catalog
+
+    controller = Pa2Controller(GappedCatalogClient(), allowed_slots=None)
+
+    with pytest.raises(TelemetryError, match="contiguous"):
+        controller.list_all_presets()
+
+
 def test_activation_rejects_direct_catalog_conflict_before_any_unmute() -> None:
     class StaleCatalogClient(FakeClient):
         def ls(self, path: Iterable[str]) -> dict[str, str]:

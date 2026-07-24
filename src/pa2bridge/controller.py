@@ -1007,25 +1007,59 @@ class Pa2Controller:
         self._require_unmute_before(deadline)
         entries = self._client_ls(PRESET_ROOT, deadline=deadline)
         self._require_unmute_before(deadline)
-        try:
+        reported_count = "NumPresets" in entries
+        if reported_count:
             count = _parse_unsigned_integer(
                 "preset NumPresets", entries["NumPresets"], minimum=1, maximum=100
             )
+        else:
+            name_slots: set[int] = set()
+            for key in entries:
+                if key in {"CurrentPreset", "NumPresets"}:
+                    continue
+                if not key.startswith("Name_"):
+                    raise TelemetryError("preset catalog returned an unexpected key")
+                suffix = key.removeprefix("Name_")
+                if not _ASCII_UNSIGNED_INTEGER.fullmatch(suffix):
+                    raise TelemetryError("preset catalog returned an invalid name key")
+                slot = int(suffix, 10)
+                if not 1 <= slot <= MAX_PRESET_SLOT:
+                    raise TelemetryError(
+                        f"preset catalog inferred a slot outside 1 through {MAX_PRESET_SLOT}"
+                    )
+                name_slots.add(slot)
+            if not name_slots or name_slots != set(range(1, max(name_slots) + 1)):
+                raise TelemetryError(
+                    "preset catalog names were not a non-empty contiguous slot range"
+                )
+            count = max(name_slots)
+
+        catalog_has_current = "CurrentPreset" in entries
+        if catalog_has_current:
             current = _parse_unsigned_integer(
                 "preset CurrentPreset", entries["CurrentPreset"], minimum=1
             )
-        except KeyError as error:
-            raise TelemetryError("preset catalog metadata was incomplete") from error
-        expected = {"NumPresets", "CurrentPreset"} | {
+        else:
+            current = _parse_unsigned_integer(
+                "preset CurrentPreset",
+                self._client_get(CURRENT_PRESET, deadline=deadline),
+                minimum=1,
+            )
+            self._require_unmute_before(deadline)
+
+        expected = ({"NumPresets"} if reported_count else set()) | (
+            {"CurrentPreset"} if catalog_has_current else set()
+        ) | {
             f"Name_{slot}" for slot in range(1, count + 1)
         }
         if set(entries) != expected:
             raise TelemetryError(
-                "preset catalog keys did not exactly match NumPresets"
+                "preset catalog keys did not exactly match its reported slot range"
             )
         if current > count:
+            count_source = "NumPresets" if reported_count else "inferred preset count"
             raise TelemetryError(
-                f"preset CurrentPreset slot {current} exceeded NumPresets {count}"
+                f"preset CurrentPreset slot {current} exceeded {count_source} {count}"
             )
         if expected_current is not None and current != expected_current:
             raise TelemetryError(
