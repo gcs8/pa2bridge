@@ -148,11 +148,66 @@ def test_list_presets_is_bounded_to_allowlisted_slots() -> None:
     ]
 
 
-@pytest.mark.parametrize("allowed", [(3,), (1, 3), (1, 1), (True,)])
-def test_controller_rejects_control_slots_outside_unique_slots_one_and_two(
+def test_auto_preset_mode_uses_every_device_reported_preset() -> None:
+    controller = Pa2Controller(FakeClient(), allowed_slots=None)
+
+    presets = controller.list_presets()
+
+    assert [preset.slot for preset in presets] == [1, 2, 3]
+
+
+def test_auto_preset_mode_can_activate_a_discovered_slot() -> None:
+    client = FakeClient(current=1)
+    controller = Pa2Controller(
+        client,
+        allowed_slots=None,
+        post_recall_delay=0,
+    )
+
+    state = controller.activate_preset(3, unmute_after=False)
+
+    assert state.current_preset.slot == 3
+    assert (RECALL, "3") in client.sets
+
+
+def test_auto_preset_mode_never_unmutes_if_target_disappears_from_catalog() -> None:
+    class DisappearingPresetClient(FakeClient):
+        def __init__(self) -> None:
+            super().__init__(current=1)
+            self.catalog_reads = 0
+
+        def ls(self, path: Iterable[str]) -> dict[str, str]:
+            catalog = super().ls(path)
+            self.catalog_reads += 1
+            if self.catalog_reads >= 2:
+                catalog.pop("Name_3")
+            return catalog
+
+    client = DisappearingPresetClient()
+    controller = Pa2Controller(
+        client,
+        allowed_slots=None,
+        post_recall_delay=0,
+    )
+
+    with pytest.raises(TelemetryError, match="catalog"):
+        controller.activate_preset(3)
+
+    assert not any(value == "Off" for _, value in client.sets)
+    assert all(value == "On" for value in client.mutes.values())
+
+
+def test_controller_accepts_explicit_slots_across_the_pa2_range() -> None:
+    controller = Pa2Controller(FakeClient(), allowed_slots=(1, 32, 75, 100))
+
+    assert controller.allowed_slots == (1, 32, 75, 100)
+
+
+@pytest.mark.parametrize("allowed", [(0,), (101,), (1, 1), (True,)])
+def test_controller_rejects_control_slots_outside_unique_pa2_range(
     allowed: tuple[int, ...],
 ) -> None:
-    with pytest.raises(ValueError, match="slots 1 and 2"):
+    with pytest.raises(ValueError, match="slots 1 through 100"):
         Pa2Controller(FakeClient(), allowed_slots=allowed)
 
 

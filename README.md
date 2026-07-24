@@ -1,10 +1,10 @@
 # PA2Bridge
 
-[![Open your Home Assistant instance and show the app store with the PA2Bridge repository pre-filled.](https://my.home-assistant.io/badges/supervisor_store.svg)](https://my.home-assistant.io/redirect/supervisor_store/?repository_url=https%3A%2F%2Fgithub.com%2Fgcs8%2Fpa2bridge)
+[![Open your Home Assistant instance and add the PA2Bridge app repository.](https://my.home-assistant.io/badges/supervisor_add_addon_repository.svg)](https://my.home-assistant.io/redirect/supervisor_add_addon_repository/?repository_url=https%3A%2F%2Fgithub.com%2Fgcs8%2Fpa2bridge)
 
 A small, safety-oriented bridge for a **dbx DriveRack PA2**. It keeps one authoritative PA2 TCP session and exposes:
 
-- an allowlisted Home Assistant **Preset** select;
+- a device-discovered Home Assistant **Preset** select, optionally narrowed by an explicit allowlist;
 - automatic **output unmute only after preset recall is confirmed**;
 - a separate **Unmute all outputs** button;
 - six per-output mute switches with readback;
@@ -35,7 +35,7 @@ The supported architecture is therefore **Home Assistant App → MQTT Discovery 
 
 Preset activation is deliberately ordered:
 
-1. Start one finite absolute activation deadline, then resolve the requested preset against `allowed_preset_slots`, which is restricted to a non-empty subset of slots `1` and `2`.
+1. Start one finite absolute activation deadline, then resolve the requested preset against a fresh device-reported catalog. Automatic mode accepts every named slot reported by the PA2; an optional explicit allowlist can narrow that catalog to unique slots `1`–`100`.
 2. Set all six output mutes to `On` and verify all six readbacks. Abort before recall if any value is unknown or not muted.
 3. Write the PA2 `Recall` value only when the target differs from the current slot. The original entry deadline applies to catalog resolution, preflight muting, identity/current reads, recall, and the already-active path without reset.
 4. Poll `CurrentPreset` until the target slot is confirmed, reconnecting the console within the same bounded deadline if preset loading drops or stalls the original session.
@@ -59,7 +59,7 @@ Additional guardrails:
 - Preset inventory and crossover entities require both common and detail availability, so an abrupt bridge loss or failed detail refresh cannot present stale retained attributes as current.
 - PA2 connect, reconnect, close, poll, and command transactions are serialized under one lifecycle lock.
 - MQTT callbacks accept only exact discovered command topics and enqueue at most one command bound to the current broker-session generation. The broker-state lock linearizes final authorization with the serialized PA2 transaction; a disconnect recorded first rejects the command and closes PA2, while a rejected subscription or publish exits without reusing the failed client.
-- Presets not explicitly allowlisted cannot be selected or recalled.
+- Presets absent from the fresh device-reported catalog cannot be selected or recalled. When an explicit allowlist is configured, presets outside it are also rejected.
 - Input/output meter and input clip entities are opt-in and disabled by default to avoid Home Assistant recorder churn.
 - Protocol input rejects newlines, quotes, and path separators in untrusted values/components.
 - MQTT topic prefixes must be exact NFC text with no controls, wildcards, empty levels, or normalization-changing Unicode. Supervisor broker host data is validated without trimming, while opaque MQTT username and password values are preserved byte-for-codepoint rather than silently normalized.
@@ -76,10 +76,12 @@ The app package lives in [`pa2bridge/`](pa2bridge/). After a reviewed release im
 
 1. In Home Assistant, open **Settings → Apps → App store → Repositories**.
 2. Add `https://github.com/gcs8/pa2bridge`.
-3. Install **PA2Bridge** and enter the PA2 host, credentials, and approved preset slots.
+3. Install **PA2Bridge** and enter the PA2 host. Leave `pa2_password_override` blank to use the factory-default administrator password, and leave `preset_slots` set to `auto` to publish every preset reported by the PA2.
 4. Confirm every other PA2 writer is stopped before starting the app.
 
 The app requests Home Assistant's `mqtt:need` service and receives dedicated broker credentials from Supervisor. PA2 and MQTT secrets are not placed in Git or Stream Deck profiles.
+
+Upgrading from v0.1.1 requires a manual update because the configuration fields changed. Factory-password users can leave `pa2_password_override` blank. Users with a custom PA2 password must re-enter it in that field before starting v0.1.2. Use `preset_slots` for `auto` or a comma-separated restriction; do not edit the legacy `allowed_preset_slots` compatibility field.
 
 `recall_timeout` is limited to 20 seconds. This preserves a 10-second margin below the bridge's 30-second MQTT keepalive while the final broker-session authorization lock is held across a PA2 transaction.
 
@@ -112,6 +114,12 @@ PA2BRIDGE_MQTT_PASSWORD=replace-with-the-unique-password
 ```
 
 The Home Assistant Mosquitto app accepts Home Assistant user credentials and rejects anonymous clients. Do not put either password in `config.toml` or Git.
+
+Preset slots are discovered automatically. To narrow the selectable presets, add a unique list of slots from `1` through `100`, for example:
+
+```toml
+allowed_preset_slots = [1, 2, 32]
+```
 
 If the PA2 administrator password is no longer the factory default, add this to `[pa2]`:
 
@@ -188,7 +196,7 @@ MQTT discovery creates one HA device named from the PA2's observed `Instance_Nam
 - **Unmute all outputs** (`button`).
 - **High/Mid/Low Left/Right mute** (`switch`, six total).
 - **Firmware** and **Last command** (`sensor`, diagnostic).
-- **Preset inventory** (`sensor`, diagnostic) — state is the number of named presets; attributes contain every observed slot/name. Recall remains limited to the configured allowlist.
+- **Preset inventory** (`sensor`, diagnostic) — state is the number of named presets; attributes contain every observed slot/name. Recall uses all discovered presets by default and can be narrowed with an explicit allowlist.
 - **Crossover** (`sensor`, diagnostic) — attributes contain topology plus every reported band's HPF/LPF frequency and type, gain, and polarity, which is sufficient for a dashboard to render crossover curves.
 - Optional **Left/Right input level**, **High/Mid/Low Left/Right output level**, and **Left/Right input clip** entities when `expose_meters = true`; they are disabled by default.
 
@@ -257,7 +265,7 @@ uv run pytest --cov="$PWD/src/pa2bridge" --cov-report=term-missing
 uv build
 ```
 
-Current suite (**277 tests, 89.18% total coverage**): protocol framing/auth/get/ls, no-response and delayed-echo `set` sequencing, preset allowlisting, confirmed recall ordering, no-unmute-on-timeout, six-output readback, MQTT discovery and broker-session locking, subscription-failure availability cleanup, standalone and Supervisor configuration bounds, app/release metadata, secret-safe loading, and complete CLI mute/unmute/error behavior.
+Current suite: protocol framing/auth/get/ls, no-response and delayed-echo `set` sequencing, automatic preset discovery and optional allowlisting, confirmed recall ordering, no-unmute-on-timeout, six-output readback, MQTT discovery and broker-session locking, subscription-failure availability cleanup, standalone and Supervisor configuration bounds, app/release metadata, secret-safe loading, and complete CLI mute/unmute/error behavior.
 
 ## Protocol notes
 

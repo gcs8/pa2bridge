@@ -134,20 +134,20 @@ def test_unknown_standalone_configuration_keys_are_rejected(
         load_config(path, environ={})
 
 
-def test_allowed_preset_slots_are_restricted_to_slots_one_and_two(tmp_path: Path) -> None:
+def test_allowed_preset_slots_are_restricted_to_the_pa2_range(tmp_path: Path) -> None:
     path = tmp_path / "config.toml"
     path.write_text(
         """
 [pa2]
 host = "192.0.2.20"
-allowed_preset_slots = [1, 3]
+allowed_preset_slots = [1, 101]
 
 [mqtt]
 host = "homeassistant.local"
 """.strip()
     )
 
-    with pytest.raises(ConfigError, match="slots 1 and 2"):
+    with pytest.raises(ConfigError, match="slots 1 through 100"):
         load_config(path, environ={})
 
 
@@ -180,6 +180,29 @@ def test_default_credentials_are_redacted_and_bad_topic_prefix_is_rejected(tmp_p
     )
     with pytest.raises(ConfigError, match="must not be empty"):
         load_config(invalid, environ={})
+
+
+def test_standalone_config_auto_discovers_presets_when_allowlist_is_omitted(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text('[pa2]\nhost="pa2"\n[mqtt]\nhost="broker"\n')
+
+    config = load_config(path, environ={})
+
+    assert config.pa2.allowed_preset_slots is None
+
+
+def test_standalone_config_accepts_full_pa2_preset_range(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text(
+        '[pa2]\nhost="pa2"\nallowed_preset_slots=[1,32,75,100]\n'
+        '[mqtt]\nhost="broker"\n'
+    )
+
+    config = load_config(path, environ={})
+
+    assert config.pa2.allowed_preset_slots == (1, 32, 75, 100)
 
 
 @pytest.mark.parametrize(

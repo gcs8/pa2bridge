@@ -30,8 +30,8 @@ def _options(**overrides: object) -> dict[str, object]:
         "pa2_host": "192.0.2.20",
         "pa2_port": 19272,
         "pa2_username": "administrator",
-        "pa2_password": "pa2-secret",
-        "allowed_preset_slots": [1, 2],
+        "pa2_password_override": "pa2-secret",
+        "preset_slots": "1, 2",
         "connect_timeout": 3.0,
         "recall_timeout": 10.0,
         "poll_interval": 0.2,
@@ -66,6 +66,69 @@ def test_load_ha_app_config_uses_supervisor_options_and_mqtt_service(tmp_path: P
     assert "mqtt-secret" not in repr(config)
 
 
+@pytest.mark.parametrize("password", [None, ""])
+def test_load_ha_app_config_uses_factory_password_when_blank(
+    tmp_path: Path,
+    password: object,
+) -> None:
+    path = tmp_path / "options.json"
+    _write_options(
+        path,
+        _options(pa2_password_override=password, preset_slots="auto"),
+    )
+
+    config = load_ha_app_config(path, environ=MQTT_ENV)
+
+    assert config.pa2.password == "administrator"
+    assert config.pa2.allowed_preset_slots is None
+
+
+def test_load_ha_app_config_accepts_comma_separated_preset_allowlist(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "options.json"
+    _write_options(path, _options(preset_slots="1, 32, 75, 100"))
+
+    config = load_ha_app_config(path, environ=MQTT_ENV)
+
+    assert config.pa2.allowed_preset_slots == (1, 32, 75, 100)
+
+
+def test_load_ha_app_config_accepts_v011_legacy_options(tmp_path: Path) -> None:
+    path = tmp_path / "options.json"
+    options = _options()
+    options.pop("pa2_password_override")
+    options.pop("preset_slots")
+    options["pa2_password"] = "legacy-pa2-secret"
+    options["allowed_preset_slots"] = [1, 32, 100]
+    _write_options(path, options)
+
+    config = load_ha_app_config(path, environ=MQTT_ENV)
+
+    assert config.pa2.password == "legacy-pa2-secret"
+    assert config.pa2.allowed_preset_slots == (1, 32, 100)
+    assert "legacy-pa2-secret" not in repr(config)
+
+
+def test_load_ha_app_config_accepts_supervisor_merged_v011_defaults(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "options.json"
+    _write_options(
+        path,
+        _options(
+            pa2_password_override="",
+            preset_slots="auto",
+            allowed_preset_slots=[1, 2],
+        ),
+    )
+
+    config = load_ha_app_config(path, environ=MQTT_ENV)
+
+    assert config.pa2.password == "administrator"
+    assert config.pa2.allowed_preset_slots is None
+
+
 def test_load_ha_app_config_rejects_non_network_pa2_host(tmp_path: Path) -> None:
     path = tmp_path / "options.json"
     _write_options(path, _options(pa2_host="pa2/bridge"))
@@ -85,9 +148,9 @@ def test_load_ha_app_config_rejects_non_network_pa2_host(tmp_path: Path) -> None
         ("post_recall_delay", -1),
         ("state_poll_interval", float("inf")),
         ("expose_meters", "false"),
-        ("allowed_preset_slots", [1, True]),
-        ("allowed_preset_slots", [1, 1]),
-        ("allowed_preset_slots", [1, 3]),
+        ("preset_slots", [1, True]),
+        ("preset_slots", "1, 1"),
+        ("preset_slots", "1, 101"),
         ("base_topic", "driverack/+/pa2"),
         ("base_topic", " driverack/pa2"),
         ("base_topic", "driverack/pa2\n"),
@@ -161,21 +224,21 @@ def test_load_ha_app_config_rejects_duplicate_json_keys(tmp_path: Path) -> None:
     path = tmp_path / "options.json"
     raw = json.dumps(_options())
     path.write_text(
-        raw[:-1] + ',"allowed_preset_slots":[2]}',
+        raw[:-1] + ',"preset_slots":"2"}',
         encoding="utf-8",
     )
 
-    with pytest.raises(ConfigError, match="duplicate.*allowed_preset_slots"):
+    with pytest.raises(ConfigError, match="duplicate.*preset_slots"):
         load_ha_app_config(path, environ=MQTT_ENV)
 
 
 def test_load_ha_app_config_rejects_unknown_option_names(tmp_path: Path) -> None:
     options = _options()
-    options["allowed_preset_slot"] = options.pop("allowed_preset_slots")
+    options["preset_slot"] = options.pop("preset_slots")
     path = tmp_path / "options.json"
     _write_options(path, options)
 
-    with pytest.raises(ConfigError, match="unknown.*allowed_preset_slot"):
+    with pytest.raises(ConfigError, match="unknown.*preset_slot"):
         load_ha_app_config(path, environ=MQTT_ENV)
 
 
@@ -184,8 +247,14 @@ def test_home_assistant_app_metadata_is_bounded_and_requires_mqtt() -> None:
 
     assert "slug: pa2bridge" in config
     assert "- mqtt:need" in config
-    assert '- "int(1,2)"' in config
-    assert "int(1,100)" not in config
+    assert "preset_slots: auto" in config
+    assert "preset_slots: str" in config
+    assert 'pa2_password_override: ""' in config
+    assert 'pa2_password_override: password' in config
+    assert 'allowed_preset_slots:\n    - "int(1,100)?"' in config
+    assert 'breaking_versions:\n  - "0.1.2"' in config
+    assert '- "int(1,2)"' not in config
+    assert 'pa2_password: "password?"' not in config
     assert "host_network: true" not in config
     assert "hassio_api: true" not in config
     assert "homeassistant_api: true" not in config
@@ -200,7 +269,11 @@ def test_public_install_shape_is_a_supervisor_managed_app_not_hacs() -> None:
 
     assert "name: PA2Bridge Home Assistant App Repository" in repository
     assert 'url: "https://github.com/gcs8/pa2bridge"' in repository
-    assert "my.home-assistant.io/redirect/supervisor_store/" in readme
+    assert (
+        "my.home-assistant.io/redirect/supervisor_add_addon_repository/" in readme
+    )
+    assert "my.home-assistant.io/badges/supervisor_add_addon_repository.svg" in readme
+    assert "my.home-assistant.io/redirect/supervisor_store/" not in readme
     assert "repository_url=https%3A%2F%2Fgithub.com%2Fgcs8%2Fpa2bridge" in readme
     assert "HACS is not required" in readme
     assert "Home Assistant OS is required" in readme

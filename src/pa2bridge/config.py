@@ -16,6 +16,7 @@ from typing import Any
 
 MQTT_KEEPALIVE_SECONDS = 30
 MAX_RECALL_TIMEOUT_SECONDS = 20.0
+MAX_PRESET_SLOT = 100
 
 _TOP_LEVEL_KEYS = {"pa2", "mqtt"}
 _PA2_KEYS = {
@@ -49,6 +50,45 @@ class ConfigError(ValueError):
     """Configuration is missing, unsafe, or internally inconsistent."""
 
 
+def parse_allowed_preset_slots(
+    value: object,
+    *,
+    description: str,
+) -> tuple[int, ...] | None:
+    """Return an explicit PA2 slot allowlist, or ``None`` for auto-discovery."""
+
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        if text.lower() == "auto":
+            return None
+        parts = [part.strip() for part in text.split(",")]
+        if not parts or any(re.fullmatch(r"[1-9][0-9]*", part, re.ASCII) is None for part in parts):
+            raise ConfigError(
+                f"{description} must be 'auto' or a comma-separated list of preset slots"
+            )
+        slots = tuple(int(part, 10) for part in parts)
+    elif isinstance(value, (list, tuple)):
+        slots = tuple(value)
+    else:
+        raise ConfigError(
+            f"{description} must be 'auto' or a list of preset slots"
+        )
+    if not slots or any(
+        not isinstance(slot, int)
+        or isinstance(slot, bool)
+        or not 1 <= slot <= MAX_PRESET_SLOT
+        for slot in slots
+    ):
+        raise ConfigError(
+            f"{description} must contain only integer slots 1 through {MAX_PRESET_SLOT}"
+        )
+    if len(set(slots)) != len(slots):
+        raise ConfigError(f"{description} must not contain duplicates")
+    return slots
+
+
 def validate_network_host(value: Any, *, description: str) -> str:
     """Return an ASCII hostname or IP address suitable for sockets and IDs."""
     if (
@@ -79,7 +119,7 @@ class Pa2Config:
     port: int = 19272
     username: str = "administrator"
     password: str = field(default="administrator", repr=False)
-    allowed_preset_slots: tuple[int, ...] = (1,)
+    allowed_preset_slots: tuple[int, ...] | None = None
     connect_timeout: float = 3.0
     recall_timeout: float = 10.0
     poll_interval: float = 0.2
@@ -264,15 +304,10 @@ def load_config(path: str | Path, *, environ: Mapping[str, str] | None = None) -
             f"unknown [mqtt] configuration key(s): {', '.join(unknown_mqtt)}"
         )
 
-    slots_value = pa2_data.get("allowed_preset_slots")
-    if not isinstance(slots_value, list) or not slots_value or not all(
-        isinstance(slot, int) and not isinstance(slot, bool) for slot in slots_value
-    ):
-        raise ConfigError("[pa2].allowed_preset_slots must be a non-empty integer list")
-    if any(slot not in {1, 2} for slot in slots_value):
-        raise ConfigError("[pa2].allowed_preset_slots must contain only slots 1 and 2")
-    if len(set(slots_value)) != len(slots_value):
-        raise ConfigError("[pa2].allowed_preset_slots must not contain duplicates")
+    allowed_preset_slots = parse_allowed_preset_slots(
+        pa2_data.get("allowed_preset_slots"),
+        description="[pa2].allowed_preset_slots",
+    )
 
     pa2 = Pa2Config(
         host=validate_network_host(
@@ -284,7 +319,7 @@ def load_config(path: str | Path, *, environ: Mapping[str, str] | None = None) -
             pa2_data, "username", "pa2", default="administrator"
         ),
         password=_secret_from_env(pa2_data, "password", env, default="administrator") or "",
-        allowed_preset_slots=tuple(slots_value),
+        allowed_preset_slots=allowed_preset_slots,
         connect_timeout=_finite_number(
             pa2_data,
             "connect_timeout",

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.2
+
+- Default a blank or omitted PA2 password to the factory administrator password.
+- Discover and expose all device-reported presets by default; the PA2 supports user slots 1–75 and factory slots 76–100.
+- Replace the broken Home Assistant numeric-array field with `auto` or an optional comma-separated slot allowlist.
+- Preserve Supervisor upgrade compatibility with v0.1.1 options. The manual update introduces `pa2_password_override` and `preset_slots`; users with a custom PA2 password must re-enter it, and the legacy numeric-list key is accepted only for migration.
+
 ## 0.1.1
 
 - Initial public Home Assistant App release.

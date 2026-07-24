@@ -10,7 +10,7 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Protocol
 
-from .config import MAX_RECALL_TIMEOUT_SECONDS
+from .config import MAX_PRESET_SLOT, MAX_RECALL_TIMEOUT_SECONDS
 from .protocol import ProtocolError
 
 
@@ -232,7 +232,7 @@ class Pa2Controller:
         self,
         client: Client,
         *,
-        allowed_slots: Iterable[int],
+        allowed_slots: Iterable[int] | None,
         recall_timeout: float = 10.0,
         poll_interval: float = 0.2,
         post_recall_delay: float = 1.0,
@@ -240,19 +240,22 @@ class Pa2Controller:
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self.client = client
-        self.allowed_slots = tuple(allowed_slots)
-        if not self.allowed_slots:
-            raise ValueError("at least one allowed preset slot is required")
-        if (
-            len(set(self.allowed_slots)) != len(self.allowed_slots)
-            or any(
-                not isinstance(slot, int)
-                or isinstance(slot, bool)
-                or slot not in {1, 2}
-                for slot in self.allowed_slots
-            )
-        ):
-            raise ValueError("allowed preset slots must be unique members of slots 1 and 2")
+        self.allowed_slots = None if allowed_slots is None else tuple(allowed_slots)
+        if self.allowed_slots is not None:
+            if not self.allowed_slots:
+                raise ValueError("at least one allowed preset slot is required")
+            if (
+                len(set(self.allowed_slots)) != len(self.allowed_slots)
+                or any(
+                    not isinstance(slot, int)
+                    or isinstance(slot, bool)
+                    or not 1 <= slot <= MAX_PRESET_SLOT
+                    for slot in self.allowed_slots
+                )
+            ):
+                raise ValueError(
+                    f"allowed preset slots must be unique members of slots 1 through {MAX_PRESET_SLOT}"
+                )
         timings = (
             (
                 "recall_timeout",
@@ -292,6 +295,8 @@ class Pa2Controller:
     def list_presets(self) -> list[Preset]:
         with self._lock:
             catalog = self._preset_catalog()
+            if self.allowed_slots is None:
+                return [preset for _, preset in sorted(catalog.items())]
             return [catalog[slot] for slot in self.allowed_slots if slot in catalog]
 
     def list_all_presets(self) -> list[Preset]:
@@ -528,7 +533,7 @@ class Pa2Controller:
             expected_current=current,
             deadline=deadline,
         )
-        if current not in self.allowed_slots:
+        if self.allowed_slots is not None and current not in self.allowed_slots:
             raise OutputVerificationError(
                 f"current preset slot {current} is not allowed; outputs were not unmuted"
             )
@@ -1042,7 +1047,10 @@ class Pa2Controller:
         deadline: float | None = None,
     ) -> Preset:
         catalog = self._preset_catalog(deadline=deadline)
-        presets = [catalog[slot] for slot in self.allowed_slots if slot in catalog]
+        if self.allowed_slots is None:
+            presets = [preset for _, preset in sorted(catalog.items())]
+        else:
+            presets = [catalog[slot] for slot in self.allowed_slots if slot in catalog]
         by_slot = {preset.slot: preset for preset in presets}
         if isinstance(target, int) and not isinstance(target, bool):
             slot = target
