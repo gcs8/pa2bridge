@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from pa2bridge.controller import Pa2Controller
 from pa2bridge.protocol import (
     AuthenticationError,
     HiQnetClient,
@@ -108,6 +109,23 @@ def test_client_authenticates_and_supports_get_ls_and_set() -> None:
         'ls "\\\\Storage\\Presets\\SV"',
         'set "\\\\Storage\\Presets\\SV\\Recall" "2"',
     ]
+
+
+def test_controller_accepts_device_catalog_without_num_presets_metadata() -> None:
+    with fake_pa2() as (address, _commands):
+        host = str(address[0])
+        port = int(address[1])
+        client = HiQnetClient(host, port=port, timeout=1)
+        client.connect("administrator", "administrator")
+        controller = Pa2Controller(client, allowed_slots=None)
+
+        presets = controller.list_all_presets()
+
+        assert [(preset.slot, preset.name) for preset in presets] == [
+            (1, "Flat"),
+            (2, "Alternate"),
+        ]
+        client.close()
 
 
 def test_set_is_fire_and_forget_so_the_next_get_reads_its_own_response() -> None:

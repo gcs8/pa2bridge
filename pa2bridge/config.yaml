@@ -1,5 +1,5 @@
 name: PA2Bridge
-version: "0.1.2"
+version: "0.1.3"
 slug: pa2bridge
 description: Safely control and monitor a dbx DriveRack PA2 through Home Assistant
 url: "https://github.com/gcs8/pa2bridge/tree/main/pa2bridge"

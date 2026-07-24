@@ -81,7 +81,7 @@ The app package lives in [`pa2bridge/`](pa2bridge/). After a reviewed release im
 
 The app requests Home Assistant's `mqtt:need` service and receives dedicated broker credentials from Supervisor. PA2 and MQTT secrets are not placed in Git or Stream Deck profiles.
 
-Upgrading from v0.1.1 requires a manual update because the configuration fields changed. Factory-password users can leave `pa2_password_override` blank. Users with a custom PA2 password must re-enter it in that field before starting v0.1.2. Use `preset_slots` for `auto` or a comma-separated restriction; do not edit the legacy `allowed_preset_slots` compatibility field.
+Upgrading from v0.1.1 requires a manual update because the configuration fields changed. Factory-password users can leave `pa2_password_override` blank. Users with a custom PA2 password must re-enter it in that field before starting v0.1.2 or newer. Use `preset_slots` for `auto` or a comma-separated restriction; do not edit the legacy `allowed_preset_slots` compatibility field.
 
 `recall_timeout` is limited to 20 seconds. This preserves a 10-second margin below the bridge's 30-second MQTT keepalive while the final broker-session authorization lock is held across a PA2 transaction.
 
