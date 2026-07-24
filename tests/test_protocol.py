@@ -21,6 +21,7 @@ from pa2bridge.protocol import (
 class _Handler(socketserver.StreamRequestHandler):
     commands: list[str] = []
     echo_sets = False
+    echo_setr = False
 
     def handle(self) -> None:
         self.wfile.write(b"HiQnet Console\r\n")
@@ -44,6 +45,34 @@ class _Handler(socketserver.StreamRequestHandler):
                     b'\t* : \r\n'
                     b'endls\r\n'
                 )
+            elif command == 'ls "\\\\Preset\\Crossover\\AT"':
+                self.wfile.write(
+                    b'ls "\\\\Preset\\Crossover\\AT"\r\n'
+                    b'\tClass_Name : Crossover\r\n'
+                    b'\tFlags : 0\r\n'
+                    b'\tInstance_Name : Crossover\r\n'
+                    b'\tMonoSub : 1\r\n'
+                    b'\tNumBands : 1\r\n'
+                    b'\tNumSlots : 2\r\n'
+                    b'endls\r\n'
+                )
+            elif command == 'ls "\\\\Preset\\Crossover\\SV"':
+                self.wfile.write(
+                    b'ls "\\\\Preset\\Crossover\\SV"\r\n'
+                    b'\tBand_1_Gain : 0.0dB\r\n'
+                    b'\tBand_1_HPFrequency : Out\r\n'
+                    b'\tBand_1_HPType : LR 12\r\n'
+                    b'\tBand_1_LPFrequency : Out\r\n'
+                    b'\tBand_1_LPType : LR 48\r\n'
+                    b'\tBand_1_Polarity : Normal\r\n'
+                    b'\tMonoSub_Gain : -1.5dB\r\n'
+                    b'\tMonoSub_HPFrequency : 35.5Hz\r\n'
+                    b'\tMonoSub_HPType : BW 6\r\n'
+                    b'\tMonoSub_LPFrequency : 0.08kHz\r\n'
+                    b'\tMonoSub_LPType : LR 12\r\n'
+                    b'\tMonoSub_Polarity : Inverted\r\n'
+                    b'endls\r\n'
+                )
             elif command == 'get "\\\\Slow"':
                 continue
             elif command.startswith("set "):
@@ -51,6 +80,8 @@ class _Handler(socketserver.StreamRequestHandler):
                 # response frame; the following get/ls owns the next reply.
                 if self.echo_sets:
                     self.wfile.write((command + "\r\n").encode())
+                elif self.echo_setr:
+                    self.wfile.write(("setr" + command[3:] + "\r\n").encode())
                 else:
                     continue
             else:
@@ -63,9 +94,10 @@ class _Server(socketserver.ThreadingTCPServer):
 
 
 @contextmanager
-def fake_pa2(*, echo_sets: bool = False):
+def fake_pa2(*, echo_sets: bool = False, echo_setr: bool = False):
     _Handler.commands = []
     _Handler.echo_sets = echo_sets
+    _Handler.echo_setr = echo_setr
     server = _Server(("127.0.0.1", 0), _Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -76,6 +108,7 @@ def fake_pa2(*, echo_sets: bool = False):
         server.server_close()
         thread.join(timeout=2)
         _Handler.echo_sets = False
+        _Handler.echo_setr = False
 
 
 def test_encode_path_uses_two_leading_backslashes_and_single_separators() -> None:
@@ -128,6 +161,22 @@ def test_controller_accepts_device_catalog_without_num_presets_metadata() -> Non
         client.close()
 
 
+def test_controller_accepts_observed_crossover_wire_shape() -> None:
+    with fake_pa2() as (address, _commands):
+        host = str(address[0])
+        port = int(address[1])
+        client = HiQnetClient(host, port=port, timeout=1)
+        client.connect("administrator", "administrator")
+        controller = Pa2Controller(client, allowed_slots=None)
+
+        crossover = controller.crossover()
+
+        assert crossover.num_bands == 1
+        assert crossover.mono_sub is True
+        assert [band.identifier for band in crossover.bands] == ["Band_1", "MonoSub"]
+        client.close()
+
+
 def test_set_is_fire_and_forget_so_the_next_get_reads_its_own_response() -> None:
     with fake_pa2() as ((host, port), _):
         client = HiQnetClient(host, port=port, timeout=1)
@@ -151,6 +200,40 @@ def test_delayed_set_echoes_are_discarded_before_the_next_get_response() -> None
             assert client.get(("Node", "AT", "Instance_Name")) == "DriveRackPA2"
         finally:
             client.close()
+
+
+def test_correlated_setr_acknowledgement_is_discarded_before_get_response() -> None:
+    with fake_pa2(echo_setr=True) as ((host, port), _):
+        client = HiQnetClient(host, port=port, timeout=1)
+        try:
+            client.connect("administrator", "administrator")
+            client.set(("Preset", "OutputGains", "SV", "HighLeftOutputMute"), "On")
+
+            assert client.get(("Node", "AT", "Instance_Name")) == "DriveRackPA2"
+        finally:
+            client.close()
+
+
+def test_mismatched_setr_acknowledgement_invalidates_session() -> None:
+    clock = SimpleNamespace(now=0.0)
+    sock = _LateSocket(
+        clock,
+        (
+            'setr "\\\\Preset\\OutputGains\\SV\\HighLeftOutputMute" "Off"\n'
+            'get "\\\\Node\\AT\\Instance_Name" "DriveRackPA2"\n'
+        ).encode(),
+    )
+    client = HiQnetClient("example.invalid", timeout=1.0)
+    client._socket = sock  # type: ignore[assignment]
+    client._pending_set_echoes.append(
+        'set "\\\\Preset\\OutputGains\\SV\\HighLeftOutputMute" "On"'
+    )
+
+    with pytest.raises(ProtocolError, match="unexpected response"):
+        client.get(("Node", "AT", "Instance_Name"))
+
+    assert client.connected is False
+    assert sock.closed is True
 
 
 def test_get_turns_device_error_into_protocol_error() -> None:
@@ -492,6 +575,50 @@ def test_multiple_carriage_returns_in_frame_ending_invalidate_session() -> None:
 
     with pytest.raises(ProtocolError, match="control character"):
         client.get(("Storage", "Presets", "SV", "CurrentPreset"))
+
+    assert client.connected is False
+    assert sock.closed is True
+
+
+def test_oversized_response_line_invalidates_session_before_parsing() -> None:
+    clock = SimpleNamespace(now=0.0)
+    sock = _LateSocket(clock, b"")
+    client = HiQnetClient("example.invalid", timeout=1.0)
+    client._socket = sock  # type: ignore[assignment]
+    client._buffer.extend(b"x" * 65537 + b"\n")
+
+    with pytest.raises(ProtocolError, match="maximum frame size"):
+        client.get(("Node", "AT", "Instance_Name"))
+
+    assert client.connected is False
+    assert sock.closed is True
+
+
+def test_response_line_at_exact_maximum_size_is_accepted() -> None:
+    client = HiQnetClient("example.invalid", timeout=1.0)
+    client._buffer.extend(b"x" * 65536 + b"\n")
+
+    line = client._read_line(float("inf"))
+
+    assert len(line) == 65536
+
+
+def test_oversized_response_line_streamed_across_chunks_invalidates_session() -> None:
+    class ChunkedSocket(_LateSocket):
+        def __init__(self) -> None:
+            super().__init__(SimpleNamespace(now=0.0), b"")
+            self.chunks = [b"x" * 32768, b"x" * 32769]
+
+        def recv(self, size: int) -> bytes:
+            del size
+            return self.chunks.pop(0)
+
+    sock = ChunkedSocket()
+    client = HiQnetClient("example.invalid", timeout=1.0)
+    client._socket = sock  # type: ignore[assignment]
+
+    with pytest.raises(ProtocolError, match="maximum frame size"):
+        client.get(("Node", "AT", "Instance_Name"))
 
     assert client.connected is False
     assert sock.closed is True

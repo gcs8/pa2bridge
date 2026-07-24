@@ -58,15 +58,16 @@ Additional guardrails:
 - Home Assistant reports the device online only after a complete fresh PA2 snapshot; transport or verification failure immediately closes the PA2 session and reports offline.
 - Preset inventory and crossover entities require both common and detail availability, so an abrupt bridge loss or failed detail refresh cannot present stale retained attributes as current.
 - PA2 connect, reconnect, close, poll, and command transactions are serialized under one lifecycle lock.
-- MQTT callbacks accept only exact discovered command topics and enqueue at most one command bound to the current broker-session generation. The broker-state lock linearizes final authorization with the serialized PA2 transaction; a disconnect recorded first rejects the command and closes PA2, while a rejected subscription or publish exits without reusing the failed client.
+- MQTT callbacks accept only exact discovered command topics and enqueue at most one command bound to the current broker-session generation. The broker-state lock linearizes final authorization with the serialized PA2 transaction; a disconnect recorded first rejects queued commands, closes PA2, and starts bounded automatic MQTT reconnects. Polling and commands remain disabled until a fresh command subscription is acknowledged. Rejected subscriptions and publishes remain fatal.
 - Presets absent from the fresh device-reported catalog cannot be selected or recalled. When an explicit allowlist is configured, presets outside it are also rejected.
+- The slow detail refresh compares fresh selectable preset labels and republishes retained MQTT discovery only when those labels change, so device-side rename/store operations do not leave stale select options.
 - Input/output meter and input clip entities are opt-in and disabled by default to avoid Home Assistant recorder churn.
-- Protocol input rejects newlines, quotes, and path separators in untrusted values/components.
+- Protocol input rejects newlines, quotes, and path separators in untrusted values/components. Each PA2 response line is limited to 64 KiB without resetting the enclosing absolute operation deadline.
 - MQTT topic prefixes must be exact NFC text with no controls, wildcards, empty levels, or normalization-changing Unicode. Supervisor broker host data is validated without trimming, while opaque MQTT username and password values are preserved byte-for-codepoint rather than silently normalized.
 
 ## Release integrity gate
 
-Image publication requires the repository variable `REVIEWED_TREE_SHA256` to equal the canonical identity reported by an independent exact-tree review. A version tag emits an untrusted `Release Candidate` signal; the `workflow_run` publisher executes its protected default-branch workflow, checks out the signaled commit, and recomputes its identity with an inline isolated standard-library verifier before tests or builds. Protect the default branch so release-workflow changes require review. Each architecture is built locally, scanned before push, and its resulting registry digest is carried through an artifact; the final multi-architecture manifest references those immutable scanned digests rather than mutable architecture tags.
+Image publication requires the repository variable `REVIEWED_TREE_SHA256` to equal the canonical identity reported by an independent exact-tree review. A version tag emits an untrusted `Release Candidate` signal; the `workflow_run` publisher executes its protected default-branch workflow, checks out the signaled commit, and recomputes its identity with an inline isolated standard-library verifier before tests or builds. Protect the default branch so release-workflow changes require review. Each architecture is built locally, scanned before push, and its resulting registry digest is carried through an artifact; the final multi-architecture manifest references those immutable scanned digests rather than mutable architecture tags. An authenticated fail-closed registry guard checks that the final version tag is absent both before architecture builds and immediately before publication; a completed version image cannot be replaced by rerunning the workflow.
 
 Do not create a release tag or change `REVIEWED_TREE_SHA256` until the exact candidate has passed all review gates. Any byte change requires a new identity and fresh independent review.
 
@@ -81,7 +82,7 @@ The app package lives in [`pa2bridge/`](pa2bridge/). After a reviewed release im
 
 The app requests Home Assistant's `mqtt:need` service and receives dedicated broker credentials from Supervisor. PA2 and MQTT secrets are not placed in Git or Stream Deck profiles.
 
-Upgrading from v0.1.1 requires a manual update because the configuration fields changed. Factory-password users can leave `pa2_password_override` blank. Users with a custom PA2 password must re-enter it in that field before starting v0.1.2 or newer. Use `preset_slots` for `auto` or a comma-separated restriction; do not edit the legacy `allowed_preset_slots` compatibility field.
+Upgrading from v0.1.1 requires a manual update because the configuration fields changed. Factory-password users can leave `pa2_password_override` blank. Users with a custom PA2 password must re-enter it in that field before starting v0.1.2 or newer. A retained restrictive legacy `allowed_preset_slots` list remains the active narrower restriction while `preset_slots` is `auto`. If both fields contain explicit lists, PA2Bridge accepts equivalent slot sets regardless of order and rejects differing restrictions instead of widening recall scope.
 
 `recall_timeout` is limited to 20 seconds. This preserves a 10-second margin below the bridge's 30-second MQTT keepalive while the final broker-session authorization lock is held across a PA2 transaction.
 
@@ -265,7 +266,7 @@ uv run pytest --cov="$PWD/src/pa2bridge" --cov-report=term-missing
 uv build
 ```
 
-Current suite: protocol framing/auth/get/ls, no-response and delayed-echo `set` sequencing, automatic preset discovery and optional allowlisting, confirmed recall ordering, no-unmute-on-timeout, six-output readback, MQTT discovery and broker-session locking, subscription-failure availability cleanup, standalone and Supervisor configuration bounds, app/release metadata, secret-safe loading, and complete CLI mute/unmute/error behavior.
+Current suite: protocol framing/auth/get/ls, no-response and exact correlated `set`/`setr` acknowledgement sequencing, automatic preset discovery and optional allowlisting, confirmed recall ordering, no-unmute-on-timeout, six-output readback, MQTT discovery and broker-session locking, subscription-failure availability cleanup, standalone and Supervisor configuration bounds, app/release metadata, secret-safe loading, and complete CLI mute/unmute/error behavior.
 
 ## Protocol notes
 

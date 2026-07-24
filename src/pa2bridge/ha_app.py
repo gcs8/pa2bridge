@@ -92,11 +92,39 @@ def _boolean(values: Mapping[str, Any], key: str, *, default: bool) -> bool:
 
 
 def _allowed_slots(values: Mapping[str, Any]) -> tuple[int, ...] | None:
-    key = "preset_slots" if "preset_slots" in values else "allowed_preset_slots"
-    return parse_allowed_preset_slots(
-        values.get(key, "auto"),
-        description=f"Home Assistant option {key}",
+    canonical_present = "preset_slots" in values
+    legacy_present = "allowed_preset_slots" in values
+    canonical = (
+        parse_allowed_preset_slots(
+            values["preset_slots"],
+            description="Home Assistant option preset_slots",
+        )
+        if canonical_present
+        else None
     )
+    legacy = (
+        parse_allowed_preset_slots(
+            values["allowed_preset_slots"],
+            description="Home Assistant option allowed_preset_slots",
+        )
+        if legacy_present
+        else None
+    )
+    if canonical_present and legacy_present:
+        if canonical is None:
+            return legacy
+        if legacy is None:
+            return canonical
+        if set(canonical) != set(legacy):
+            raise ConfigError(
+                "Home Assistant option preset_slots conflicts with allowed_preset_slots"
+            )
+        return canonical
+    if canonical_present:
+        return canonical
+    if legacy_present:
+        return legacy
+    return None
 
 
 def _pa2_password(values: Mapping[str, Any]) -> str:

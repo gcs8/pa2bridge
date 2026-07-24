@@ -19,7 +19,7 @@ connect logged in as administrator
 
 The bridge accepts either the exact login banner directly or one exact `HiQnet Console` greeting followed immediately by that banner. Any other intervening frame invalidates the session rather than being skipped as stale traffic.
 
-Commands are newline terminated. Device responses observed on firmware `1.2.0.1` use CRLF, which the parser normalizes.
+Commands are newline terminated. Device responses observed on firmware `1.2.0.1` use CRLF, which the parser normalizes. A single response line is bounded to 64 KiB before UTF-8 decoding; an oversized line closes the session, and receive chunks continue to share the caller's original absolute deadline.
 
 ## Absolute paths
 
@@ -57,7 +57,7 @@ Recall slot 2:
 set "\\Storage\Presets\SV\Recall" "2"
 ```
 
-On the validated firmware, ordinary `set` writes are fire-and-forget: the PA2 accepts the command without returning an echo or acknowledgement frame. PA2Bridge does not wait for an acknowledgement. It records each exact write and, before the next `get` or `ls` response, defensively discards only matching delayed `set` echoes in TCP order. The protocol fixture covers both no-response firmware behavior and multiple echoed writes followed by a same-session `get`.
+PA2Bridge treats ordinary `set` writes as asynchronous and does not block waiting for a reply. Observed PA2 behavior includes no response, an exact delayed `set` echo, and an exact `setr` acknowledgement. PA2Bridge records each queued write and, before the next `get` or `ls` response, discards only an exact `set` or `setr` frame with the same path and value, in TCP order. Mismatched or unsolicited acknowledgements remain protocol errors and invalidate the session.
 
 After this write, PA2Bridge polls `CurrentPreset` and will not continue to the unmute phase until it reads `2`.
 
@@ -111,9 +111,9 @@ The following paths were confirmed with authorized `ls`/`get` operations against
 | Input levels | `\\Preset\InputMeters\SV\{Left,Right}Input` | decimal `dB` value |
 | Input clip | `\\Preset\InputMeters\SV\{Left,Right}InputClip` | exact `0` or `1` |
 | Output levels | `\\Preset\OutputMeters\SV\{High,Mid,Low}{Left,Right}Output` | decimal `dB` value |
-| Crossover topology | `\\Preset\Crossover\AT\{NumBands,MonoSub}` | bounded integer / exact `0` or `1` |
+| Crossover topology | `\\Preset\Crossover\AT\{NumBands,MonoSub}` | bounded integer / exact `0` or `1`; firmware `1.2.0.1` also reports `Class_Name`, `Flags`, `Instance_Name`, and `NumSlots` siblings |
 | Crossover curves | `\\Preset\Crossover\SV\{Band_1,Band_2,Band_3,MonoSub}_{HPFrequency,HPType,Gain,LPFrequency,LPType,Polarity}` | frequency or `Out`, `BW`/`LR` type, dB gain, polarity |
 
-The active firmware reports only band keys that exist in the current preset. PA2Bridge groups those reported keys rather than inventing absent bands. Meter numbers and topology flags are parsed strictly; malformed, unknown, `nan`, and infinite values are not published.
+The active firmware reports only band keys that exist in the current preset. PA2Bridge groups those reported keys rather than inventing absent bands. The four observed crossover-topology siblings are ignored for curve construction; they are accepted only by exact, case-sensitive key name, while any other sibling is rejected and named in diagnostics. Meter numbers and authoritative topology flags are parsed strictly; malformed, unknown, `nan`, and infinite values are not published.
 
 No verified Console object for the front-panel **System Lockout** setting was found in PA2UI or in the inspected PA2 object tree. `\\Node\AT\Access_Rights` exists, but its semantics are not equivalent evidence for System Lockout, so PA2Bridge intentionally does not expose it as a lock state.

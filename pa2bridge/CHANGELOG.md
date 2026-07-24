@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.5
+
+- Accept only exact correlated PA2 `setr` write acknowledgements, fixing verified mute, unmute, and preset-recall commands while continuing to reject mismatched or unsolicited frames.
+- Accept the narrow auxiliary crossover-topology metadata observed on PA2 firmware while preserving strict rejection of unknown or malformed topology fields.
+- Recover from transient MQTT disconnects, invalidate queued command sessions until a fresh subscription acknowledgement, and refresh discovery when allowed preset labels change.
+- Reconcile retained legacy and canonical preset allowlists without widening recall access or locking out equivalent restrictions.
+- Bound protocol response lines to 64 KiB without extending operation deadlines.
+- Prevent release workflow reruns from replacing an existing versioned GHCR image tag.
+
 ## 0.1.4
 
 - Accept the eight auxiliary preset-storage keys observed on DriveRack PA2 firmware 1.2.0.1 without treating their values as preset-catalog data.

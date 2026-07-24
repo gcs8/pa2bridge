@@ -279,10 +279,11 @@ class MqttBridge:
         self.mqtt = mqtt.Client(
             callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
             client_id=config.mqtt.client_id,
-            reconnect_on_failure=False,
+            reconnect_on_failure=True,
         )
         self.mqtt.max_queued_messages_set(100)
         self.mqtt.max_inflight_messages_set(20)
+        self.mqtt.reconnect_delay_set(min_delay=1, max_delay=30)
 
         if config.mqtt.username is not None:
             self.mqtt.username_pw_set(config.mqtt.username, config.mqtt.password)
@@ -300,6 +301,7 @@ class MqttBridge:
         self._mqtt_transport_connected = False
         self._mqtt_generation = 0
         self._mqtt_ready = threading.Event()
+        self._mqtt_state_changed = threading.Event()
         self._stop_event = threading.Event()
         self._mqtt_failure: MqttPublishError | None = None
         self._pending_subscribe_mid: int | None = None
@@ -330,8 +332,7 @@ class MqttBridge:
                 raise MqttPublishError("MQTT connection callback timed out")
             if self._mqtt_failure is not None:
                 raise self._mqtt_failure
-            if not self._mqtt_connected:
-                raise MqttPublishError("MQTT connection was not accepted")
+
             self._publish(
                 f"{self.config.mqtt.base_topic}/status/details",
                 "offline",
@@ -343,9 +344,21 @@ class MqttBridge:
 
             next_poll = 0.0
             reconnect_delay = 1.0
-            while True:
+            while not self._stop_event.is_set():
                 if self._mqtt_failure is not None:
                     raise self._mqtt_failure
+                with self._mqtt_state_lock:
+                    mqtt_connected = self._mqtt_connected
+                if not mqtt_connected:
+                    self._mqtt_state_changed.clear()
+                    with self._mqtt_state_lock:
+                        mqtt_connected = self._mqtt_connected
+                        mqtt_failure = self._mqtt_failure
+                    if mqtt_failure is not None:
+                        raise mqtt_failure
+                    if not mqtt_connected:
+                        self._mqtt_state_changed.wait(timeout=0.5)
+                        continue
                 if self._process_queued_diagnostic():
                     continue
                 if self._process_queued_command():
@@ -463,8 +476,31 @@ class MqttBridge:
         with self._pa2_lock:
             if not self._mqtt_connected:
                 return
+            allowed_presets = self.controller.list_presets()
             presets = self.controller.list_all_presets()
             crossover = self.controller.crossover()
+            allowed_commands = frozenset(
+                preset.label for preset in allowed_presets
+            )
+            if allowed_commands != self._preset_commands:
+                if self.device is None:
+                    raise MqttPublishError(
+                        "cannot refresh MQTT discovery before PA2 identity is available"
+                    )
+                refreshed_discovery = build_discovery_messages(
+                    device=self.device,
+                    presets=allowed_presets,
+                    base_topic=self.config.mqtt.base_topic,
+                    discovery_prefix=self.config.mqtt.discovery_prefix,
+                    expose_meters=self.config.mqtt.expose_meters,
+                )
+                for message in refreshed_discovery:
+                    self._publish(
+                        message.topic, message.payload, retain=message.retain
+                    )
+                self.discovery = refreshed_discovery
+                self._preset_commands = allowed_commands
+                self._discovery_published = True
             inventory_payload = {
                 "count": len(presets),
                 "presets": [
@@ -624,7 +660,7 @@ class MqttBridge:
                 self._mqtt_connected = False
                 self._mqtt_ready.set()
                 return
-            self._mqtt_connected = True
+            self._mqtt_connected = False
             base = self.config.mqtt.base_topic
             result, mid = client.subscribe(f"{base}/command/#", qos=1)
             if result != mqtt.MQTT_ERR_SUCCESS:
@@ -654,21 +690,32 @@ class MqttBridge:
                     "MQTT command subscription was rejected"
                 )
                 self._stop_event.set()
+            else:
+                self._mqtt_connected = True
             self._pending_subscribe_mid = None
             self._mqtt_ready.set()
+            self._mqtt_state_changed.set()
 
     def _on_disconnect(self, client, userdata, disconnect_flags, reason_code, properties) -> None:
-        del userdata, disconnect_flags, reason_code, properties
+        del client, userdata, disconnect_flags, reason_code, properties
         with self._mqtt_state_lock:
             self._mqtt_connected = False
             self._mqtt_transport_connected = False
             self._mqtt_generation += 1
-            if not self._stopping:
-                self._mqtt_failure = MqttPublishError("MQTT disconnected")
-                self._stop_event.set()
+            self._pending_subscribe_mid = None
         if not self._stopping:
-            client.disconnect()
-        self._mqtt_ready.set()
+            while True:
+                try:
+                    self._commands.get_nowait()
+                except Empty:
+                    break
+            with self._pa2_lock:
+                self._details_valid = False
+                self._discovery_published = False
+                self.pa2_client.close()
+            self._mqtt_state_changed.set()
+        else:
+            self._mqtt_ready.set()
 
     def _on_message(self, client, userdata, message) -> None:
         del client, userdata

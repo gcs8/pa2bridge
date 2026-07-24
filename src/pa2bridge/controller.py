@@ -55,6 +55,10 @@ INPUT_CLIPS: dict[str, tuple[str, ...]] = {
 
 CROSSOVER_AT = ("Preset", "Crossover", "AT")
 CROSSOVER_SV = ("Preset", "Crossover", "SV")
+_CROSSOVER_TOPOLOGY_REQUIRED_KEYS = frozenset({"NumBands", "MonoSub"})
+_CROSSOVER_TOPOLOGY_AUXILIARY_KEYS = frozenset(
+    {"Class_Name", "Flags", "Instance_Name", "NumSlots"}
+)
 _DB_PATTERN = re.compile(
     r"(-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?)(?:dB)?", re.IGNORECASE | re.ASCII
 )
@@ -875,9 +879,23 @@ class Pa2Controller:
         with self._lock:
             attributes = self.client.ls(CROSSOVER_AT)
             values = self.client.ls(CROSSOVER_SV)
-            if set(attributes) != {"NumBands", "MonoSub"}:
+            topology_keys = set(attributes)
+            missing_keys = _CROSSOVER_TOPOLOGY_REQUIRED_KEYS - topology_keys
+            unexpected_keys = (
+                topology_keys
+                - _CROSSOVER_TOPOLOGY_REQUIRED_KEYS
+                - _CROSSOVER_TOPOLOGY_AUXILIARY_KEYS
+            )
+            if missing_keys or unexpected_keys:
+                problems = []
+                if missing_keys:
+                    problems.append(f"missing keys: {', '.join(sorted(missing_keys))}")
+                if unexpected_keys:
+                    problems.append(
+                        f"unexpected keys: {', '.join(sorted(unexpected_keys))}"
+                    )
                 raise TelemetryError(
-                    "crossover topology keys were not exactly NumBands and MonoSub"
+                    f"crossover topology returned {'; '.join(problems)}"
                 )
             try:
                 num_bands = _parse_unsigned_integer(
@@ -1020,14 +1038,17 @@ class Pa2Controller:
         self._require_unmute_before(deadline)
         entries = self._client_ls(PRESET_ROOT, deadline=deadline)
         self._require_unmute_before(deadline)
-        for key in entries:
-            if (
-                key in _PRESET_CATALOG_METADATA_KEYS
-                or key in _PRESET_CATALOG_AUXILIARY_KEYS
-                or key.startswith("Name_")
-            ):
-                continue
-            raise TelemetryError("preset catalog returned an unexpected key")
+        unexpected_keys = sorted(
+            key
+            for key in entries
+            if key not in _PRESET_CATALOG_METADATA_KEYS
+            and key not in _PRESET_CATALOG_AUXILIARY_KEYS
+            and not key.startswith("Name_")
+        )
+        if unexpected_keys:
+            raise TelemetryError(
+                f"preset catalog returned unexpected keys: {', '.join(unexpected_keys)}"
+            )
         reported_count = "NumPresets" in entries
         if reported_count:
             count = _parse_unsigned_integer(
