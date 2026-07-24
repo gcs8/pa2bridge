@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.4
+
+- Accept the eight auxiliary preset-storage keys observed on DriveRack PA2 firmware 1.2.0.1 without treating their values as preset-catalog data.
+- Continue to reject unrecognized catalog keys while preserving contiguous slot, current-preset, deadline, and fail-closed unmute validation.
+
 ## 0.1.3
 
 - Accept PA2 preset catalogs that omit optional `NumPresets` or embedded `CurrentPreset` metadata while continuing to require a contiguous device-reported slot range from 1 through 100.

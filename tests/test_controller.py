@@ -1286,6 +1286,50 @@ def test_preset_catalog_accepts_contiguous_names_when_metadata_is_omitted() -> N
     assert [preset.slot for preset in controller.list_all_presets()] == [1, 2, 3]
 
 
+def test_preset_catalog_accepts_observed_pa2_auxiliary_keys() -> None:
+    class ObservedCatalogClient(FakeClient):
+        def ls(self, path: Iterable[str]) -> dict[str, str]:
+            assert tuple(path) == PRESET_ROOT
+            return {
+                "CurrentPreset": "1",
+                **{f"Name_{slot}": f"Preset {slot}" for slot in range(1, 101)},
+                **{
+                    key: "ignored"
+                    for key in {
+                        "Bypass",
+                        "Changed",
+                        "Enable",
+                        "Recall",
+                        "ReloadPreset",
+                        "RenamePreset",
+                        "Store",
+                        "StoreCount",
+                    }
+                },
+            }
+
+    controller = Pa2Controller(ObservedCatalogClient(), allowed_slots=None)
+
+    presets = controller.list_all_presets()
+
+    assert len(presets) == 100
+    assert presets[0].slot == 1
+    assert presets[-1].slot == 100
+
+
+def test_preset_catalog_rejects_unobserved_auxiliary_key() -> None:
+    class UnknownCatalogKeyClient(FakeClient):
+        def ls(self, path: Iterable[str]) -> dict[str, str]:
+            catalog = super().ls(path)
+            catalog["UnobservedField"] = "ignored"
+            return catalog
+
+    controller = Pa2Controller(UnknownCatalogKeyClient(), allowed_slots=None)
+
+    with pytest.raises(TelemetryError, match="unexpected key"):
+        controller.list_all_presets()
+
+
 def test_current_preset_brackets_catalog_without_embedded_current_read() -> None:
     class CatalogWithoutCurrentClient(FakeClient):
         def __init__(self) -> None:
