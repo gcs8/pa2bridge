@@ -49,7 +49,7 @@ List slot names:
 ls "\\Storage\Presets\SV"
 ```
 
-The validated PA2 reported `NumPresets : 100`, but later catalog responses showed that `NumPresets` and catalog-embedded `CurrentPreset` are optional metadata. PA2Bridge accepts their omission only when the device reports a non-empty contiguous `Name_1` through `Name_n` range bounded to slots 1–100. When `CurrentPreset` is omitted from `ls`, the bridge performs a bounded direct read and requires it to agree with any safety-sensitive pre-catalog read. Examples below use generic names for user slots 1 and 2.
+The validated PA2 reported `NumPresets : 100`, but later catalog responses showed that `NumPresets` and catalog-embedded `CurrentPreset` are optional metadata. PA2Bridge accepts their omission only when the device reports a non-empty contiguous `Name_1` through `Name_n` range bounded to slots 1–100. Firmware 1.2.0.1 also returned the known sibling keys `Bypass`, `Changed`, `Enable`, `Recall`, `ReloadPreset`, `RenamePreset`, `Store`, and `StoreCount`; PA2Bridge ignores those fields when constructing the read-only catalog but continues to reject any unrecognized key. When `CurrentPreset` is omitted from `ls`, the bridge performs a bounded direct read and requires it to agree with any safety-sensitive pre-catalog read. Examples below use generic names for user slots 1 and 2.
 
 Recall slot 2:
 

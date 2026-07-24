@@ -17,6 +17,19 @@ from .protocol import ProtocolError
 PRESET_ROOT = ("Storage", "Presets", "SV")
 CURRENT_PRESET = (*PRESET_ROOT, "CurrentPreset")
 RECALL = (*PRESET_ROOT, "Recall")
+_PRESET_CATALOG_METADATA_KEYS = frozenset({"CurrentPreset", "NumPresets"})
+_PRESET_CATALOG_AUXILIARY_KEYS = frozenset(
+    {
+        "Bypass",
+        "Changed",
+        "Enable",
+        "Recall",
+        "ReloadPreset",
+        "RenamePreset",
+        "Store",
+        "StoreCount",
+    }
+)
 
 OUTPUT_MUTES: dict[str, tuple[str, ...]] = {
     f"{band}_{side}": ("Preset", "OutputGains", "SV", f"{band.title()}{side.title()}OutputMute")
@@ -1007,6 +1020,14 @@ class Pa2Controller:
         self._require_unmute_before(deadline)
         entries = self._client_ls(PRESET_ROOT, deadline=deadline)
         self._require_unmute_before(deadline)
+        for key in entries:
+            if (
+                key in _PRESET_CATALOG_METADATA_KEYS
+                or key in _PRESET_CATALOG_AUXILIARY_KEYS
+                or key.startswith("Name_")
+            ):
+                continue
+            raise TelemetryError("preset catalog returned an unexpected key")
         reported_count = "NumPresets" in entries
         if reported_count:
             count = _parse_unsigned_integer(
@@ -1015,10 +1036,11 @@ class Pa2Controller:
         else:
             name_slots: set[int] = set()
             for key in entries:
-                if key in {"CurrentPreset", "NumPresets"}:
+                if (
+                    key in _PRESET_CATALOG_METADATA_KEYS
+                    or key in _PRESET_CATALOG_AUXILIARY_KEYS
+                ):
                     continue
-                if not key.startswith("Name_"):
-                    raise TelemetryError("preset catalog returned an unexpected key")
                 suffix = key.removeprefix("Name_")
                 if not _ASCII_UNSIGNED_INTEGER.fullmatch(suffix):
                     raise TelemetryError("preset catalog returned an invalid name key")
@@ -1049,7 +1071,7 @@ class Pa2Controller:
 
         expected = ({"NumPresets"} if reported_count else set()) | (
             {"CurrentPreset"} if catalog_has_current else set()
-        ) | {
+        ) | (set(entries) & _PRESET_CATALOG_AUXILIARY_KEYS) | {
             f"Name_{slot}" for slot in range(1, count + 1)
         }
         if set(entries) != expected:
