@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.6
+
+- Verify each output mute write before sending the next channel and apply bounded inter-channel pacing, preventing the PA2 Console and front-panel telemetry from being wedged by the pre-recall six-write burst.
+- Retain a final all-six readback and the existing absolute recall, rollback, and fail-closed unmute deadlines.
+
 ## 0.1.5
 
 - Accept only exact correlated PA2 `setr` write acknowledgements, fixing verified mute, unmute, and preset-recall commands while continuing to reject mismatched or unsolicited frames.
