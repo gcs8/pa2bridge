@@ -5,7 +5,8 @@ port = 19272
 username = "administrator"
 # Uses the PA2 factory default when omitted. For a changed password, use:
 # password_env = "PA2BRIDGE_PA2_PASSWORD"
-allowed_preset_slots = [1, 2]
+# All device-reported presets are available by default. To narrow the list, use:
+# allowed_preset_slots = [1, 2, 32]
 connect_timeout = 3.0
 # Maximum 20 seconds: preserves an MQTT keepalive safety margin.
 recall_timeout = 10.0

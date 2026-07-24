@@ -1,6 +1,6 @@
 [project]
 name = "pa2bridge"
-version = "0.1.1"
+version = "0.1.2"
 description = "DriveRack PA2 bridge for Home Assistant, MQTT, and Stream Deck"
 license = "MIT"
 requires-python = ">=3.11"

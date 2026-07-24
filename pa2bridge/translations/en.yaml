@@ -8,12 +8,15 @@ configuration:
   pa2_username:
     name: PA2 username
     description: Username used to authenticate to the PA2 Console.
-  pa2_password:
-    name: PA2 password
-    description: Password used to authenticate to the PA2 Console.
-  allowed_preset_slots:
+  pa2_password_override:
+    name: PA2 password override
+    description: Password used to authenticate to the PA2 Console. Leave blank for the factory default.
+  preset_slots:
     name: Allowed preset slots
-    description: Only these inspected preset slots may be recalled.
+    description: Use auto for every device-reported preset, or enter unique slots 1-100 separated by commas.
+  allowed_preset_slots:
+    name: Legacy preset slots
+    description: Retained only so v0.1.1 options can be upgraded. Use Allowed preset slots above.
   connect_timeout:
     name: Connection timeout
     description: Maximum seconds for each PA2 network operation.

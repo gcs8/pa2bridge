@@ -8,7 +8,7 @@ import logging
 import math
 import os
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +19,7 @@ from .config import (
     MqttConfig,
     Pa2Config,
     has_disallowed_mqtt_codepoint,
+    parse_allowed_preset_slots,
     validate_mqtt_topic_prefix,
     validate_network_host,
 )
@@ -33,10 +34,12 @@ _ALLOWED_OPTION_KEYS = {
     "expose_meters",
     "pa2_host",
     "pa2_password",
+    "pa2_password_override",
     "pa2_port",
     "pa2_username",
     "poll_interval",
     "post_recall_delay",
+    "preset_slots",
     "recall_timeout",
     "state_poll_interval",
 }
@@ -88,28 +91,22 @@ def _boolean(values: Mapping[str, Any], key: str, *, default: bool) -> bool:
     return value
 
 
-def _allowed_slots(values: Mapping[str, Any]) -> tuple[int, ...]:
-    value = values.get("allowed_preset_slots", [1, 2])
-    if (
-        not isinstance(value, Sequence)
-        or isinstance(value, (str, bytes))
-        or not value
-        or any(
-            not isinstance(slot, int)
-            or isinstance(slot, bool)
-            or slot not in {1, 2}
-            for slot in value
-        )
-    ):
-        raise ConfigError(
-            "Home Assistant option allowed_preset_slots must be a non-empty list "
-            "containing only integer slots 1 and 2"
-        )
-    if len(set(value)) != len(value):
-        raise ConfigError(
-            "Home Assistant option allowed_preset_slots must not contain duplicates"
-        )
-    return tuple(value)
+def _allowed_slots(values: Mapping[str, Any]) -> tuple[int, ...] | None:
+    key = "preset_slots" if "preset_slots" in values else "allowed_preset_slots"
+    return parse_allowed_preset_slots(
+        values.get(key, "auto"),
+        description=f"Home Assistant option {key}",
+    )
+
+
+def _pa2_password(values: Mapping[str, Any]) -> str:
+    key = "pa2_password_override" if "pa2_password_override" in values else "pa2_password"
+    value = values.get(key)
+    if value is None or value == "":
+        return "administrator"
+    if not isinstance(value, str) or not value.strip():
+        raise ConfigError(f"Home Assistant option {key} must be blank or a non-empty string")
+    return value
 
 
 def _topic_prefix(values: Mapping[str, Any], key: str, *, default: str) -> str:
@@ -182,7 +179,7 @@ def load_ha_app_config(
         ),
         port=_port(options, "pa2_port", default=19272),
         username=_required_string(options, "pa2_username"),
-        password=_required_string(options, "pa2_password"),
+        password=_pa2_password(options),
         allowed_preset_slots=_allowed_slots(options),
         connect_timeout=_number(
             options,
