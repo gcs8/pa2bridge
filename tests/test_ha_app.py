@@ -269,7 +269,7 @@ def test_release_workflow_gates_publication_on_tests_scans_and_exact_image() -> 
     assert 'for package in pa2bridge hatchling editables; do' in workflow
     assert "uv sync --frozen --group dev\n" not in workflow
     assert "uv run --no-sync pip-audit --strict" in workflow
-    assert "gitleaks/gitleaks-action@" in workflow
+    assert "gitleaks dir --no-banner --redact ." in workflow
     assert "aquasecurity/trivy-action@" in workflow
     assert "load: true" in workflow
     assert "push: false" in workflow
@@ -403,6 +403,16 @@ def test_release_workflow_binds_triggering_tag_to_app_version() -> None:
     )
     assert matching.returncode == 0
     assert mismatched.returncode != 0
+
+
+def test_release_workflow_uses_a_workflow_run_compatible_secret_scan() -> None:
+    workflow = (PROJECT_ROOT / ".github" / "workflows" / "build-app.yaml").read_text()
+
+    assert "gitleaks/gitleaks-action" not in workflow
+    assert "GITLEAKS_VERSION: 8.30.1" in workflow
+    assert "gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" in workflow
+    assert "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb" in workflow
+    assert "gitleaks dir --no-banner --redact ." in workflow
 
 
 def test_final_publication_gate_refetches_and_rejects_a_moved_tag(
