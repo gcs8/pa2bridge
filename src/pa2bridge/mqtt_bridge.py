@@ -14,6 +14,7 @@ import paho.mqtt.client as mqtt
 
 from .config import AppConfig, MQTT_KEEPALIVE_SECONDS
 from .controller import (
+    DeviceIdentity,
     INPUT_CLIPS,
     INPUT_LEVELS,
     OUTPUT_LEVELS,
@@ -310,6 +311,9 @@ class MqttBridge:
         self._details_valid = False
         self._last_detail_refresh = 0.0
         self._last_detail_slot: int | None = None
+        self._pa2_identity: tuple[int, DeviceIdentity] | None = None
+        self._allowed_presets: tuple[Preset, ...] = ()
+        self._discovery_needs_refresh = False
         self._preset_commands: frozenset[str] = frozenset()
         # At most one command may wait behind the serialized worker. A bounded
         # single-slot queue prevents stale actuator sequences from accumulating.
@@ -476,17 +480,17 @@ class MqttBridge:
         with self._pa2_lock:
             if not self._mqtt_connected:
                 return
-            allowed_presets = self.controller.list_presets()
-            presets = self.controller.list_all_presets()
+            allowed_presets, presets = self.controller.list_preset_views()
             crossover = self.controller.crossover()
             allowed_commands = frozenset(
                 preset.label for preset in allowed_presets
             )
-            if allowed_commands != self._preset_commands:
+            if allowed_commands != self._preset_commands or self._discovery_needs_refresh:
                 if self.device is None:
                     raise MqttPublishError(
                         "cannot refresh MQTT discovery before PA2 identity is available"
                     )
+                self._allowed_presets = tuple(allowed_presets)
                 refreshed_discovery = build_discovery_messages(
                     device=self.device,
                     presets=allowed_presets,
@@ -501,6 +505,7 @@ class MqttBridge:
                 self.discovery = refreshed_discovery
                 self._preset_commands = allowed_commands
                 self._discovery_published = True
+                self._discovery_needs_refresh = False
             inventory_payload = {
                 "count": len(presets),
                 "presets": [
@@ -569,13 +574,14 @@ class MqttBridge:
                 reconnected = not self.pa2_client.connected
                 if reconnected:
                     self._connect_pa2()
+                identity = self._identity_for_connection()
                 if not self._discovery_published:
                     for message in self.discovery:
                         self._publish(
                             message.topic, message.payload, retain=message.retain
                         )
                     self._discovery_published = True
-                state = self.controller.state()
+                state = self.controller.state(identity=identity)
                 now = time.monotonic()
                 refresh_overdue = (
                     now - self._last_detail_refresh >= DETAIL_REFRESH_INTERVAL
@@ -622,16 +628,17 @@ class MqttBridge:
 
     def _connect_pa2(self) -> None:
         with self._pa2_lock:
+            self._pa2_identity = None
             self.pa2_client.connect(self.config.pa2.username, self.config.pa2.password)
             identity = self.controller.identity()
-            presets = self.controller.list_presets()
-            self._preset_commands = frozenset(preset.label for preset in presets)
-            safe_host = self.config.pa2.host.replace(".", "_").replace(":", "_")
-            self.device = DeviceInfo(
-                identifier=f"driverack_pa2_{safe_host}",
-                name=identity.instance_name,
-                firmware=identity.firmware,
+            self._pa2_identity = (
+                self.pa2_client.connection_generation,
+                identity,
             )
+            presets = self.controller.list_presets()
+            self._allowed_presets = tuple(presets)
+            self._preset_commands = frozenset(preset.label for preset in presets)
+            self.device = self._device_info(identity)
             self.discovery = build_discovery_messages(
                 device=self.device,
                 presets=presets,
@@ -640,7 +647,43 @@ class MqttBridge:
                 expose_meters=self.config.mqtt.expose_meters,
             )
             self._discovery_published = False
+            self._discovery_needs_refresh = False
             self._details_valid = False
+
+    def _device_info(self, identity: DeviceIdentity) -> DeviceInfo:
+        safe_host = self.config.pa2.host.replace(".", "_").replace(":", "_")
+        return DeviceInfo(
+            identifier=f"driverack_pa2_{safe_host}",
+            name=identity.instance_name,
+            firmware=identity.firmware,
+        )
+
+    def _identity_for_connection(self) -> DeviceIdentity:
+        generation = self.pa2_client.connection_generation
+        cached = self._pa2_identity
+        if cached is None or cached[0] != generation:
+            identity = self.controller.identity()
+            self._pa2_identity = (generation, identity)
+            self.device = self._device_info(identity)
+            self.discovery = build_discovery_messages(
+                device=self.device,
+                presets=list(self._allowed_presets),
+                base_topic=self.config.mqtt.base_topic,
+                discovery_prefix=self.config.mqtt.discovery_prefix,
+                expose_meters=self.config.mqtt.expose_meters,
+            )
+            self._discovery_published = False
+            self._discovery_needs_refresh = True
+            self._details_valid = False
+            return identity
+        return cached[1]
+
+    def _state_with_current_identity(self, state: Pa2State) -> Pa2State:
+        return Pa2State(
+            identity=self._identity_for_connection(),
+            current_preset=state.current_preset,
+            output_mutes=state.output_mutes,
+        )
 
     def _on_connect(self, client, userdata, flags, reason_code, properties) -> None:
         del userdata, flags, properties
@@ -811,8 +854,11 @@ class MqttBridge:
                         )
                         device_touched = True
                         state = self.controller.activate_preset(
-                            command.payload, unmute_after=True
+                            command.payload,
+                            unmute_after=True,
+                            identity=self._identity_for_connection(),
                         )
+                        state = self._state_with_current_identity(state)
                         result = (
                             f"recalled {state.current_preset.label}; outputs verified unmuted"
                         )
@@ -820,7 +866,9 @@ class MqttBridge:
                     elif command.topic == f"{base}/command/unmute":
                         device_touched = True
                         self.controller.set_all_outputs_muted(False)
-                        state = self.controller.state()
+                        state = self.controller.state(
+                            identity=self._identity_for_connection()
+                        )
                         result = "all outputs verified unmuted"
                     else:
                         channel = command.topic.rsplit("/", 1)[-1]
@@ -828,7 +876,9 @@ class MqttBridge:
                         self.controller.set_output_muted(
                             channel, command.payload == "On"
                         )
-                        state = self.controller.state()
+                        state = self.controller.state(
+                            identity=self._identity_for_connection()
+                        )
                         result = f"{channel} mute verified {command.payload}"
                     self.publish_state(state)
                     if refresh_details:

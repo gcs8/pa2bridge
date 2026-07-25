@@ -111,10 +111,17 @@ class HiQnetClient:
         self._pending_set_echoes: deque[str] = deque()
         self._lock = threading.RLock()
         self._credentials: tuple[str, str] | None = None
+        self._connection_generation = 0
 
     @property
     def connected(self) -> bool:
         return self._socket is not None
+
+    @property
+    def connection_generation(self) -> int:
+        """Identify the current successfully authenticated console session."""
+
+        return self._connection_generation
 
     def connect(self, username: str = "administrator", password: str = "administrator") -> None:
         self._connect(
@@ -169,6 +176,7 @@ class HiQnetClient:
                     line = self._read_line(deadline)
                 if line == f"connect logged in as {username}":
                     self._credentials = (username, password)
+                    self._connection_generation += 1
                     return
                 if line.startswith("connect logged in"):
                     raise AuthenticationError(

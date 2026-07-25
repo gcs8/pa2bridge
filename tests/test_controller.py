@@ -5,6 +5,7 @@ from collections.abc import Iterable
 import pytest
 
 from pa2bridge.controller import (
+    DeviceIdentity,
     INPUT_CLIPS,
     INPUT_LEVELS,
     OUTPUT_LEVELS,
@@ -27,12 +28,15 @@ class FakeClient:
         self.current = current
         self.recall_changes = recall_changes
         self.sets: list[tuple[tuple[str, ...], str]] = []
+        self.gets: list[tuple[str, ...]] = []
+        self.ls_calls = 0
         self.mutes = {path: "On" for path in OUTPUT_MUTES.values()}
         self.bad_verify_path: tuple[str, ...] | None = None
         self.reconnects = 0
 
     def get(self, path: Iterable[str]) -> str:
         path = tuple(path)
+        self.gets.append(path)
         if path == CURRENT_PRESET:
             return str(self.current)
         if path in self.mutes:
@@ -56,6 +60,7 @@ class FakeClient:
 
     def ls(self, path: Iterable[str]) -> dict[str, str]:
         assert tuple(path) == PRESET_ROOT
+        self.ls_calls += 1
         return {
             "NumPresets": "3",
             "CurrentPreset": str(self.current),
@@ -146,6 +151,47 @@ def test_list_presets_is_bounded_to_allowlisted_slots() -> None:
         (1, "Flat", "1: Flat"),
         (2, "Alternate", "2: Alternate"),
     ]
+
+
+def test_preset_views_share_one_validated_catalog_read() -> None:
+    client = FakeClient()
+    controller = Pa2Controller(client, allowed_slots=(1, 2))
+
+    allowed, complete = controller.list_preset_views()
+
+    assert [preset.slot for preset in allowed] == [1, 2]
+    assert [preset.slot for preset in complete] == [1, 2, 3]
+    assert client.ls_calls == 1
+
+
+def test_state_reuses_identity_from_the_current_connection() -> None:
+    client = FakeClient()
+    controller = Pa2Controller(client, allowed_slots=(1, 2))
+    identity = DeviceIdentity("dbxDriveRackPA2", "Cached PA2", "1.2.0.1")
+
+    state = controller.state(identity=identity)
+
+    assert state.identity is identity
+    assert not any(path[:2] == ("Node", "AT") for path in client.gets)
+
+
+def test_activation_reuses_identity_from_the_current_connection() -> None:
+    client = FakeClient(current=1)
+    controller = Pa2Controller(
+        client,
+        allowed_slots=(1, 2),
+        post_recall_delay=0,
+    )
+    identity = DeviceIdentity("dbxDriveRackPA2", "Cached PA2", "1.2.0.1")
+
+    state = controller.activate_preset(
+        1,
+        unmute_after=False,
+        identity=identity,
+    )
+
+    assert state.identity is identity
+    assert not any(path[:2] == ("Node", "AT") for path in client.gets)
 
 
 def test_auto_preset_mode_uses_every_device_reported_preset() -> None:
