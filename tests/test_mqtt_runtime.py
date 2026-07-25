@@ -115,12 +115,14 @@ class FakeMqttClient:
 class FakePa2Client:
     def __init__(self) -> None:
         self.connected = False
+        self.connection_generation = 0
         self.connect_args = None
         self.closed = 0
 
     def connect(self, username, password) -> None:
         self.connect_args = (username, password)
         self.connected = True
+        self.connection_generation += 1
 
     def close(self) -> None:
         self.closed += 1
@@ -133,6 +135,9 @@ class FakeController:
         self.all_mutes = []
         self.channel_mutes = []
         self.raise_keyboard_on_state = False
+        self.identity_calls = 0
+        self.state_identities: list[DeviceIdentity | None] = []
+        self.preset_view_calls = 0
         self.identity_value = DeviceIdentity("dbxDriveRackPA2", "DriveRackPA2", "1.2.0.1")
         self.presets = [Preset(1, "Flat"), Preset(2, "Alternate")]
         self.all_presets = [*self.presets, Preset(3, "Factory")]
@@ -166,6 +171,7 @@ class FakeController:
         )
 
     def identity(self):
+        self.identity_calls += 1
         return self.identity_value
 
     def list_presets(self):
@@ -174,13 +180,24 @@ class FakeController:
     def list_all_presets(self):
         return self.all_presets
 
+    def list_preset_views(self):
+        self.preset_view_calls += 1
+        return self.presets, self.all_presets
+
     def crossover(self):
         return self.crossover_value
 
-    def state(self):
+    def state(self, *, identity=None):
         if self.raise_keyboard_on_state:
             raise KeyboardInterrupt
-        return self.state_value
+        self.state_identities.append(identity)
+        if identity is None:
+            return self.state_value
+        return Pa2State(
+            identity,
+            self.state_value.current_preset,
+            self.state_value.output_mutes,
+        )
 
     def output_levels(self):
         return {channel: -42.25 for channel in self.state_value.output_mutes}
@@ -191,7 +208,8 @@ class FakeController:
             clips={"left": False, "right": True},
         )
 
-    def activate_preset(self, payload, *, unmute_after):
+    def activate_preset(self, payload, *, unmute_after, identity=None):
+        del identity
         self.activations.append((payload, unmute_after))
         return self.state_value
 
@@ -266,6 +284,124 @@ def test_connect_builds_discovery_and_on_connect_publishes_and_subscribes(monkey
     assert ("driverack/pa2/status/details", "online", 1, True) in client.published
 
 
+def test_poll_reuses_identity_until_the_pa2_connection_generation_changes(monkeypatch) -> None:
+    bridge, _, pa2, controller = make_bridge(monkeypatch)
+    bridge._connect_pa2()
+    bridge._discovery_published = True
+    bridge._details_valid = True
+    bridge._last_detail_slot = 1
+    bridge._last_detail_refresh = time.monotonic()
+
+    bridge._poll_once()
+    assert controller.identity_calls == 1
+    assert controller.state_identities == [controller.identity_value]
+
+    pa2.connection_generation += 1
+    bridge._poll_once()
+    assert controller.identity_calls == 2
+    assert controller.state_identities == [
+        controller.identity_value,
+        controller.identity_value,
+    ]
+
+
+def test_poll_refreshes_identity_before_republishing_discovery(monkeypatch) -> None:
+    bridge, client, pa2, controller = make_bridge(monkeypatch)
+    bridge._connect_pa2()
+    bridge._discovery_published = False
+    bridge._details_valid = True
+    bridge._last_detail_refresh = time.monotonic()
+    bridge._last_detail_slot = controller.state_value.current_preset.slot
+    pa2.connection_generation += 1
+    controller.identity_value = DeviceIdentity(
+        "dbxDriveRackPA2", "Renamed PA2", "1.2.0.2"
+    )
+
+    bridge._poll_once()
+
+    discovery_payloads = [
+        json.loads(payload)
+        for topic, payload, *_ in client.published
+        if topic.startswith("homeassistant/")
+    ]
+    assert discovery_payloads
+    assert all(
+        payload["device"]["sw_version"] == "1.2.0.2"
+        for payload in discovery_payloads
+    )
+
+
+def test_publish_details_uses_one_preset_catalog_snapshot(monkeypatch) -> None:
+    bridge, _, _, controller = make_bridge(monkeypatch)
+
+    bridge.publish_details()
+
+    assert controller.preset_view_calls == 1
+
+
+def test_mute_commands_reuse_identity_from_the_current_connection(monkeypatch) -> None:
+    bridge, _, _, controller = make_bridge(monkeypatch)
+    bridge._connect_pa2()
+
+    bridge._on_message(
+        None, None, message("driverack/pa2/command/unmute", "PRESS")
+    )
+    assert bridge._process_queued_command() is True
+    bridge._on_message(
+        None, None, message("driverack/pa2/command/mute/high_left", "On")
+    )
+    assert bridge._process_queued_command() is True
+
+    assert controller.identity_calls == 1
+    assert controller.state_identities == [
+        controller.identity_value,
+        controller.identity_value,
+    ]
+
+
+def test_recall_reconnect_refreshes_identity_before_publishing_state(monkeypatch) -> None:
+    bridge, client, pa2, controller = make_bridge(monkeypatch)
+    bridge._connect_pa2()
+    bridge._discovery_published = True
+
+    def reconnecting_activation(payload, *, unmute_after, identity=None):
+        del payload, unmute_after, identity
+        pa2.connection_generation += 1
+        controller.identity_value = DeviceIdentity(
+            "dbxDriveRackPA2", "DriveRackPA2", "1.2.0.2"
+        )
+        return controller.state_value
+
+    controller.activate_preset = reconnecting_activation
+    bridge._on_message(
+        None, None, message("driverack/pa2/command/preset", "2: Alternate")
+    )
+
+    assert bridge._process_queued_command() is True
+    assert controller.identity_calls == 2
+    assert bridge.device is not None
+    assert bridge.device.name == "DriveRackPA2"
+    assert bridge.device.firmware == "1.2.0.2"
+    assert bridge._discovery_published is True
+    discovery_payloads = [json.loads(message.payload) for message in bridge.discovery]
+    assert discovery_payloads
+    assert all(
+        payload["device"]["sw_version"] == "1.2.0.2"
+        for payload in discovery_payloads
+    )
+    assert any(
+        topic.startswith("homeassistant/")
+        and json.loads(payload)["device"]["sw_version"] == "1.2.0.2"
+        for topic, payload, *_ in client.published
+    )
+    assert (
+        "driverack/pa2/state/firmware",
+        "1.2.0.2",
+        1,
+        True,
+    ) in client.published
+
+
 def test_initial_pa2_failure_connects_mqtt_and_marks_device_offline(monkeypatch) -> None:
     bridge, client, pa2, _ = make_bridge(monkeypatch)
     bridge._mqtt_connected = False
@@ -291,7 +427,8 @@ def test_connect_callback_survives_pa2_failure_and_publishes_offline(monkeypatch
     bridge, client, pa2, controller = make_bridge(monkeypatch)
     bridge._connect_pa2()
 
-    def unavailable():
+    def unavailable(*, identity=None):
+        del identity
         raise OSError("PA2 unavailable")
 
     controller.state = unavailable
@@ -963,8 +1100,8 @@ def test_command_transport_failure_closes_pa2_and_publishes_offline(monkeypatch)
     bridge, client, pa2, controller = make_bridge(monkeypatch)
     pa2.connected = True
 
-    def transport_failure(payload, *, unmute_after):
-        del payload, unmute_after
+    def transport_failure(payload, *, unmute_after, identity=None):
+        del payload, unmute_after, identity
         raise OSError("PA2 connection lost")
 
     controller.activate_preset = transport_failure
@@ -1051,8 +1188,8 @@ def test_pa2_connect_waits_for_inflight_command_transaction(monkeypatch) -> None
     release_command = threading.Event()
     connect_started = threading.Event()
 
-    def blocking_activation(payload, *, unmute_after):
-        del payload, unmute_after
+    def blocking_activation(payload, *, unmute_after, identity=None):
+        del payload, unmute_after, identity
         command_entered.set()
         assert release_command.wait(timeout=2)
         return controller.state_value
@@ -1094,13 +1231,14 @@ def test_failed_poll_waits_for_command_then_closes_inside_same_transaction(monke
     poll_started = threading.Event()
     poll_finished = threading.Event()
 
-    def blocking_activation(payload, *, unmute_after):
-        del payload, unmute_after
+    def blocking_activation(payload, *, unmute_after, identity=None):
+        del payload, unmute_after, identity
         command_entered.set()
         assert release_command.wait(timeout=2)
         return controller.state_value
 
-    def failed_state():
+    def failed_state(*, identity=None):
+        del identity
         raise OSError("poll failed")
 
     controller.activate_preset = blocking_activation
@@ -1142,7 +1280,8 @@ def test_failed_poll_waits_for_command_then_closes_inside_same_transaction(monke
 def test_poll_failure_invalidates_core_and_detail_availability(monkeypatch) -> None:
     bridge, client, _, controller = make_bridge(monkeypatch)
 
-    def unavailable():
+    def unavailable(*, identity=None):
+        del identity
         raise OSError("PA2 unavailable")
 
     controller.state = unavailable
@@ -1156,8 +1295,8 @@ def test_poll_failure_invalidates_core_and_detail_availability(monkeypatch) -> N
 def test_preset_command_invalidates_details_before_device_recall(monkeypatch) -> None:
     bridge, client, _, controller = make_bridge(monkeypatch)
 
-    def activation(payload, *, unmute_after):
-        del payload, unmute_after
+    def activation(payload, *, unmute_after, identity=None):
+        del payload, unmute_after, identity
         assert client.published[-1] == (
             "driverack/pa2/status/details",
             "offline",

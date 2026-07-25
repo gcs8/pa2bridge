@@ -332,6 +332,22 @@ def test_reconnect_requires_prior_authentication_and_reuses_successful_credentia
         client.close()
 
 
+def test_connection_generation_changes_only_after_successful_authentication() -> None:
+    with fake_pa2() as ((host, port), _):
+        client = HiQnetClient(host, port=port, timeout=0.1)
+        assert client.connection_generation == 0
+
+        client.connect()
+        assert client.connection_generation == 1
+
+        client.reconnect()
+        assert client.connection_generation == 2
+
+        with pytest.raises(AuthenticationError):
+            client.connect("different-user", "administrator")
+        assert client.connection_generation == 2
+
+
 def test_reconnect_authentication_rejection_forgets_stale_credentials(monkeypatch) -> None:
     client = HiQnetClient("example.invalid")
     client._credentials = ("administrator", "stale-secret")

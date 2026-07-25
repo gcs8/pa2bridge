@@ -311,17 +311,28 @@ class Pa2Controller:
             )
 
     def list_presets(self) -> list[Preset]:
-        with self._lock:
-            catalog = self._preset_catalog()
-            if self.allowed_slots is None:
-                return [preset for _, preset in sorted(catalog.items())]
-            return [catalog[slot] for slot in self.allowed_slots if slot in catalog]
+        allowed, _ = self.list_preset_views()
+        return allowed
 
     def list_all_presets(self) -> list[Preset]:
         """Return the complete device catalog without expanding recall access."""
 
+        _, complete = self.list_preset_views()
+        return complete
+
+    def list_preset_views(self) -> tuple[list[Preset], list[Preset]]:
+        """Return allowed and complete views from one validated device snapshot."""
+
         with self._lock:
-            return [preset for _, preset in sorted(self._preset_catalog().items())]
+            catalog = self._preset_catalog()
+            complete = [preset for _, preset in sorted(catalog.items())]
+            if self.allowed_slots is None:
+                allowed = list(complete)
+            else:
+                allowed = [
+                    catalog[slot] for slot in self.allowed_slots if slot in catalog
+                ]
+            return allowed, complete
 
     def current_preset(self) -> Preset:
         with self._lock:
@@ -335,10 +346,10 @@ class Pa2Controller:
                     f"CurrentPreset slot {slot} was absent from the complete preset catalog"
                 ) from error
 
-    def state(self) -> Pa2State:
+    def state(self, *, identity: DeviceIdentity | None = None) -> Pa2State:
         with self._lock:
             return Pa2State(
-                identity=self.identity(),
+                identity=self.identity() if identity is None else identity,
                 current_preset=self.current_preset(),
                 output_mutes={
                     channel: _parse_output_mute(channel, self.client.get(path))
@@ -346,7 +357,13 @@ class Pa2Controller:
                 },
             )
 
-    def activate_preset(self, target: str | int, *, unmute_after: bool = True) -> Pa2State:
+    def activate_preset(
+        self,
+        target: str | int,
+        *,
+        unmute_after: bool = True,
+        identity: DeviceIdentity | None = None,
+    ) -> Pa2State:
         with self._lock:
             deadline = self._new_operation_deadline()
             self._active_recall_deadline = deadline
@@ -358,6 +375,7 @@ class Pa2Controller:
                     preset,
                     unmute_after=unmute_after,
                     deadline=deadline,
+                    identity=identity,
                 )
             except Exception as error:
                 if not outputs_touched:
@@ -384,6 +402,7 @@ class Pa2Controller:
         *,
         unmute_after: bool,
         deadline: float,
+        identity: DeviceIdentity | None,
     ) -> Pa2State:
         with self._lock:
             # Recall is only allowed after every output has been positively
@@ -392,17 +411,18 @@ class Pa2Controller:
                 True,
                 deadline=deadline,
             )
-            identity = DeviceIdentity(
-                class_name=self._client_get(
-                    ("Node", "AT", "Class_Name"), deadline=deadline
-                ),
-                instance_name=self._client_get(
-                    ("Node", "AT", "Instance_Name"), deadline=deadline
-                ),
-                firmware=self._client_get(
-                    ("Node", "AT", "Software_Version"), deadline=deadline
-                ),
-            )
+            if identity is None:
+                identity = DeviceIdentity(
+                    class_name=self._client_get(
+                        ("Node", "AT", "Class_Name"), deadline=deadline
+                    ),
+                    instance_name=self._client_get(
+                        ("Node", "AT", "Instance_Name"), deadline=deadline
+                    ),
+                    firmware=self._client_get(
+                        ("Node", "AT", "Software_Version"), deadline=deadline
+                    ),
+                )
             current = _parse_unsigned_integer(
                 "CurrentPreset",
                 self._client_get(CURRENT_PRESET, deadline=deadline),
