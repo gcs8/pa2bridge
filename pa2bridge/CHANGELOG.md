@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.7
+
+- Reduce modeled steady-state PA2 request traffic by 27.2% by reusing device identity only within the current authenticated connection generation and deriving preset views from one validated catalog snapshot per refresh.
+- Refresh device identity and Home Assistant discovery metadata after reconnects before republishing state, while preserving live CLI probe behavior, serialized transport, bounded retries, exact response correlation, and no replay on reconnect.
+- Add a repository-local, fail-closed read-only validation harness that permits one connection and exactly two polls using existing reads only; the merged behavior completed live validation with 24 commands and normal PA2 front-panel and audio operation.
+
 ## 0.1.6
 
 - Verify each output mute write before sending the next channel and apply bounded inter-channel pacing, preventing the PA2 Console and front-panel telemetry from being wedged by the pre-recall six-write burst.
