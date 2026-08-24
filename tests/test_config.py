@@ -299,7 +299,9 @@ def test_mqtt_topic_prefixes_reject_wildcards_and_empty_levels(
     value: str,
 ) -> None:
     path = tmp_path / "config.toml"
-    path.write_text(_config_text(mqtt_extra=f"{setting}={value}\n"))
+    path.write_text(
+        _config_text(mqtt_extra=f"{setting}={value}\n"), encoding="utf-8"
+    )
 
     with pytest.raises(ConfigError, match=setting):
         load_config(path, environ={})
