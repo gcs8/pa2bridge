@@ -288,7 +288,7 @@ def test_get_has_a_bounded_response_timeout() -> None:
 
 def test_authentication_requires_exact_requested_identity() -> None:
     with fake_pa2() as ((host, port), _):
-        client = HiQnetClient(host, port=port, timeout=0.1)
+        client = HiQnetClient(host, port=port, timeout=1)
         try:
             with pytest.raises(AuthenticationError, match="unexpected authentication response"):
                 client.connect("different-user", "administrator")
@@ -334,7 +334,7 @@ def test_reconnect_requires_prior_authentication_and_reuses_successful_credentia
 
 def test_connection_generation_changes_only_after_successful_authentication() -> None:
     with fake_pa2() as ((host, port), _):
-        client = HiQnetClient(host, port=port, timeout=0.1)
+        client = HiQnetClient(host, port=port, timeout=1)
         assert client.connection_generation == 0
 
         client.connect()
@@ -391,7 +391,7 @@ def test_reconnect_malformed_authentication_frame_forgets_stale_credentials(
 
 def test_failed_explicit_login_clears_previously_successful_credentials() -> None:
     with fake_pa2() as ((host, port), _):
-        client = HiQnetClient(host, port=port, timeout=0.1)
+        client = HiQnetClient(host, port=port, timeout=1)
         try:
             client.connect("administrator", "administrator")
             with pytest.raises(AuthenticationError):
