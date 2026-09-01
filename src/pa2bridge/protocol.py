@@ -52,6 +52,22 @@ def _validate_atom(value: str, *, description: str, allow_backslash: bool = True
         raise ValueError(f"{description} contains a protocol control character")
 
 
+def validate_username(value: str) -> str:
+    """Reject a username the unquoted ``connect`` frame cannot carry."""
+
+    _validate_atom(value, description="username")
+    if any(character.isspace() for character in value):
+        raise ValueError("username must not contain whitespace")
+    return value
+
+
+def validate_password(value: str) -> str:
+    """Reject a password the quoted ``connect`` frame cannot carry."""
+
+    _validate_atom(value, description="password")
+    return value
+
+
 def encode_path(path: Iterable[str]) -> str:
     """Encode path components using the PA2's two-leading-slash syntax."""
     parts = tuple(path)
@@ -144,8 +160,8 @@ class HiQnetClient:
         )
 
     def _connect(self, username: str, password: str, *, deadline: float) -> None:
-        _validate_atom(username, description="username")
-        _validate_atom(password, description="password")
+        validate_username(username)
+        validate_password(password)
         with self._lock:
             self._credentials = None
             self.close()

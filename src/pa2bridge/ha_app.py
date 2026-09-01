@@ -19,6 +19,8 @@ from .config import (
     MqttConfig,
     Pa2Config,
     has_disallowed_mqtt_codepoint,
+    pa2_password,
+    pa2_username,
     parse_allowed_preset_slots,
     validate_mqtt_topic_prefix,
     validate_network_host,
@@ -134,7 +136,7 @@ def _pa2_password(values: Mapping[str, Any]) -> str:
         return "administrator"
     if not isinstance(value, str) or not value.strip():
         raise ConfigError(f"Home Assistant option {key} must be blank or a non-empty string")
-    return value
+    return pa2_password(value, description=f"Home Assistant option {key}")
 
 
 def _topic_prefix(values: Mapping[str, Any], key: str, *, default: str) -> str:
@@ -206,7 +208,10 @@ def load_ha_app_config(
             description="Home Assistant option pa2_host",
         ),
         port=_port(options, "pa2_port", default=19272),
-        username=_required_string(options, "pa2_username"),
+        username=pa2_username(
+            _required_string(options, "pa2_username"),
+            description="Home Assistant option pa2_username",
+        ),
         password=_pa2_password(options),
         allowed_preset_slots=_allowed_slots(options),
         connect_timeout=_number(
