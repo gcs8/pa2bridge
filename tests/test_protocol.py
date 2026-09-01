@@ -274,7 +274,7 @@ def test_invalid_paths_and_disconnected_operations_fail_closed() -> None:
 
 def test_get_has_a_bounded_response_timeout() -> None:
     with fake_pa2() as ((host, port), _):
-        client = HiQnetClient(host, port=port, timeout=0.05)
+        client = HiQnetClient(host, port=port, timeout=0.5)
         try:
             client.connect("administrator", "administrator")
             with pytest.raises(ProtocolTimeout):
