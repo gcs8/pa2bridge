@@ -18,7 +18,11 @@ def _payloads_by_topic():
         discovery_prefix="homeassistant",
         expose_meters=False,
     )
-    return {message.topic: json.loads(message.payload) for message in messages}
+    return {
+        message.topic: json.loads(message.payload)
+        for message in messages
+        if message.payload
+    }
 
 
 def test_discovery_creates_preset_select_that_uses_verified_state_and_nonretained_commands() -> None:
@@ -79,6 +83,52 @@ def test_meter_entities_are_opt_in_and_disabled_by_default() -> None:
     assert len(clip_payloads) == 2
     assert all(payload["device_class"] == "problem" for payload in clip_payloads.values())
     assert all(payload["enabled_by_default"] is False for payload in clip_payloads.values())
+
+
+def test_disabled_meters_clear_previously_retained_discovery_configs() -> None:
+    messages = build_discovery_messages(
+        device=DeviceInfo(
+            identifier="driverack_pa2_192_0_2_20",
+            name="DriveRackPA2",
+            firmware="1.2.0.1",
+        ),
+        presets=[Preset(1, "Flat")],
+        base_topic="driverack/pa2",
+        discovery_prefix="homeassistant",
+        expose_meters=False,
+    )
+
+    removals = [message for message in messages if not message.payload]
+    assert len(removals) == 10
+    assert all(message.retain for message in removals)
+    removal_topics = {message.topic for message in removals}
+    assert removal_topics == {
+        "homeassistant/sensor/driverack_pa2_192_0_2_20/left_input_level/config",
+        "homeassistant/sensor/driverack_pa2_192_0_2_20/right_input_level/config",
+        "homeassistant/binary_sensor/driverack_pa2_192_0_2_20/left_input_clip/config",
+        "homeassistant/binary_sensor/driverack_pa2_192_0_2_20/right_input_clip/config",
+        "homeassistant/sensor/driverack_pa2_192_0_2_20/high_left_output_level/config",
+        "homeassistant/sensor/driverack_pa2_192_0_2_20/high_right_output_level/config",
+        "homeassistant/sensor/driverack_pa2_192_0_2_20/mid_left_output_level/config",
+        "homeassistant/sensor/driverack_pa2_192_0_2_20/mid_right_output_level/config",
+        "homeassistant/sensor/driverack_pa2_192_0_2_20/low_left_output_level/config",
+        "homeassistant/sensor/driverack_pa2_192_0_2_20/low_right_output_level/config",
+    }
+
+    enabled_messages = build_discovery_messages(
+        device=DeviceInfo(
+            identifier="driverack_pa2_192_0_2_20",
+            name="DriveRackPA2",
+            firmware="1.2.0.1",
+        ),
+        presets=[Preset(1, "Flat")],
+        base_topic="driverack/pa2",
+        discovery_prefix="homeassistant",
+        expose_meters=True,
+    )
+    assert all(message.payload for message in enabled_messages)
+    enabled_topics = {message.topic for message in enabled_messages}
+    assert removal_topics <= enabled_topics
 
 
 def test_discovery_includes_read_only_preset_inventory_and_crossover_details() -> None:

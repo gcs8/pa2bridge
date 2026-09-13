@@ -322,7 +322,7 @@ def test_poll_refreshes_identity_before_republishing_discovery(monkeypatch) -> N
     discovery_payloads = [
         json.loads(payload)
         for topic, payload, *_ in client.published
-        if topic.startswith("homeassistant/")
+        if topic.startswith("homeassistant/") and payload
     ]
     assert discovery_payloads
     assert all(
@@ -383,7 +383,11 @@ def test_recall_reconnect_refreshes_identity_before_publishing_state(monkeypatch
     assert bridge.device.name == "DriveRackPA2"
     assert bridge.device.firmware == "1.2.0.2"
     assert bridge._discovery_published is True
-    discovery_payloads = [json.loads(message.payload) for message in bridge.discovery]
+    discovery_payloads = [
+        json.loads(message.payload)
+        for message in bridge.discovery
+        if message.payload
+    ]
     assert discovery_payloads
     assert all(
         payload["device"]["sw_version"] == "1.2.0.2"
@@ -391,6 +395,7 @@ def test_recall_reconnect_refreshes_identity_before_publishing_state(monkeypatch
     )
     assert any(
         topic.startswith("homeassistant/")
+        and payload
         and json.loads(payload)["device"]["sw_version"] == "1.2.0.2"
         for topic, payload, *_ in client.published
     )

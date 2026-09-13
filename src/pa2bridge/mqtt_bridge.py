@@ -257,6 +257,25 @@ def build_discovery_messages(
                     "icon": "mdi:waveform",
                 },
             )
+    else:
+        # A previous run with expose_meters enabled left retained discovery
+        # configs on the broker; Home Assistant would keep those meter
+        # entities online forever with no state source. An empty retained
+        # payload clears the broker copy and removes the entity, and is a
+        # no-op when nothing was retained.
+        for component, object_id in (
+            *(("sensor", f"{side}_input_level") for side in INPUT_LEVELS),
+            *(("binary_sensor", f"{side}_input_clip") for side in INPUT_CLIPS),
+            *(("sensor", f"{channel}_output_level") for channel in OUTPUT_LEVELS),
+        ):
+            messages.append(
+                MqttPublish(
+                    topic=(
+                        f"{prefix}/{component}/{device.identifier}/{object_id}/config"
+                    ),
+                    payload="",
+                )
+            )
     return messages
 
 
