@@ -13,6 +13,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .protocol import validate_password, validate_username
+
 
 MQTT_KEEPALIVE_SECONDS = 30
 MAX_RECALL_TIMEOUT_SECONDS = 20.0
@@ -252,6 +254,24 @@ def _mqtt_topic_prefix(
     )
 
 
+def pa2_username(value: str, *, description: str) -> str:
+    """Return a username the PA2 console frame can carry, or fail closed."""
+
+    try:
+        return validate_username(value)
+    except ValueError as error:
+        raise ConfigError(f"{description}: {error}") from None
+
+
+def pa2_password(value: str, *, description: str) -> str:
+    """Return a password the PA2 console frame can carry, or fail closed."""
+
+    try:
+        return validate_password(value)
+    except ValueError as error:
+        raise ConfigError(f"{description}: {error}") from None
+
+
 def _secret_from_env(
     table: dict[str, Any],
     key: str,
@@ -315,10 +335,14 @@ def load_config(path: str | Path, *, environ: Mapping[str, str] | None = None) -
             description="[pa2].host",
         ),
         port=_port_value(pa2_data, "port", "pa2", default=19272),
-        username=_string_value(
-            pa2_data, "username", "pa2", default="administrator"
+        username=pa2_username(
+            _string_value(pa2_data, "username", "pa2", default="administrator"),
+            description="[pa2].username",
         ),
-        password=_secret_from_env(pa2_data, "password", env, default="administrator") or "",
+        password=pa2_password(
+            _secret_from_env(pa2_data, "password", env, default="administrator") or "",
+            description="[pa2].password",
+        ),
         allowed_preset_slots=allowed_preset_slots,
         connect_timeout=_finite_number(
             pa2_data,
