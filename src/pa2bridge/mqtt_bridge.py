@@ -441,8 +441,9 @@ class MqttBridge:
                 with self._mqtt_state_lock:
                     self._mqtt_connected = False
                     self._mqtt_transport_connected = False
-                if loop_started:
-                    self.mqtt.loop_stop()
+            if loop_started:
+                self.mqtt.loop_stop()
+            with self._pa2_lock:
                 self.pa2_client.close()
 
     def publish_state(self, state: Pa2State) -> None:
