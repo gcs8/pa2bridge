@@ -93,7 +93,10 @@ def build_parser() -> argparse.ArgumentParser:
     commands.add_parser("unmute", help="unmute all six outputs and verify readback")
     commands.add_parser("mute", help="mute all six outputs and verify readback")
     daemon = commands.add_parser("daemon", help="run the Home Assistant MQTT bridge")
-    state_home = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
+    configured_state_home = os.environ.get("XDG_STATE_HOME")
+    state_home = Path(configured_state_home) if configured_state_home else None
+    if state_home is None or not state_home.is_absolute():
+        state_home = Path.home() / ".local/state"
     daemon.add_argument(
         "--discovery-state",
         type=Path,

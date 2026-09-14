@@ -27,7 +27,10 @@ from pa2bridge.mqtt_bridge import (
     MqttPublishError,
     _fsync_directory,
     _load_discovery_topics,
+    _marker_payload,
     _save_discovery_topics,
+    _state_directory_inner_marker,
+    _state_directory_marker,
 )
 
 
@@ -592,10 +595,218 @@ def test_new_state_directory_entries_are_fsynced(
         ),
     )
 
-    chain = [state_path.parent]
-    while chain[-1].parent != chain[-1]:
-        chain.append(chain[-1].parent)
-    assert synced == [*reversed(chain), state_path.parent]
+    assert synced == [
+        tmp_path,
+        tmp_path,
+        tmp_path,
+        tmp_path / "new",
+        tmp_path / "new",
+        tmp_path / "new",
+        tmp_path / "new",
+        state_path.parent,
+        state_path.parent,
+    ]
+    assert not list(tmp_path.rglob(".pa2bridge-state-dir-*.pending"))
+
+
+def test_state_save_does_not_fsync_preexisting_ancestors(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    state_path = tmp_path / "new" / "nested" / "discovery.json"
+    forbidden_ancestor = tmp_path.parent
+    original_fsync_directory = _fsync_directory
+    synced: list[Path] = []
+
+    def reject_preexisting_ancestor(path: Path) -> None:
+        synced.append(path)
+        if path == forbidden_ancestor:
+            raise PermissionError("ancestor is traversal-only")
+        original_fsync_directory(path)
+
+    monkeypatch.setattr(
+        "pa2bridge.mqtt_bridge._fsync_directory",
+        reject_preexisting_ancestor,
+    )
+
+    _save_discovery_topics(
+        state_path,
+        frozenset(
+            {"homeassistant/select/driverack_pa2_host/preset/config"}
+        ),
+    )
+
+    assert forbidden_ancestor not in synced
+
+
+@pytest.mark.parametrize("collision", ["file", "directory", "symlink"])
+def test_unowned_state_directory_marker_collision_fails_closed(
+    tmp_path: Path,
+    collision: str,
+) -> None:
+    directory = tmp_path / "new"
+    marker = _state_directory_marker(directory)
+    if collision == "file":
+        marker.write_text("unrelated", encoding="utf-8")
+    elif collision == "directory":
+        marker.mkdir()
+    else:
+        marker.symlink_to("unrelated")
+
+    with pytest.raises(DiscoveryStateError, match="invalid.*marker"):
+        _save_discovery_topics(
+            directory / "discovery.json",
+            frozenset(
+                {"homeassistant/select/driverack_pa2_host/preset/config"}
+            ),
+        )
+
+    assert not directory.exists()
+    if collision == "file":
+        assert marker.read_text(encoding="utf-8") == "unrelated"
+    elif collision == "directory":
+        assert marker.is_dir()
+    else:
+        assert marker.is_symlink()
+        assert os.readlink(marker) == "unrelated"
+
+
+def test_valid_pending_state_directory_marker_is_recovered(tmp_path: Path) -> None:
+    directory = tmp_path / "new"
+    marker = _state_directory_marker(directory)
+    marker.symlink_to(_marker_payload(directory))
+
+    _save_discovery_topics(
+        directory / "discovery.json",
+        frozenset(
+            {"homeassistant/select/driverack_pa2_host/preset/config"}
+        ),
+    )
+
+    assert directory.is_dir()
+    assert not marker.exists() and not marker.is_symlink()
+
+
+def test_unowned_inner_state_directory_marker_fails_closed(tmp_path: Path) -> None:
+    directory = tmp_path / "new"
+    directory.mkdir()
+    marker = _state_directory_inner_marker(directory)
+    marker.write_text("unrelated", encoding="utf-8")
+
+    with pytest.raises(DiscoveryStateError, match="invalid.*marker"):
+        _save_discovery_topics(
+            directory / "discovery.json",
+            frozenset(
+                {"homeassistant/select/driverack_pa2_host/preset/config"}
+            ),
+        )
+
+    assert marker.read_text(encoding="utf-8") == "unrelated"
+
+
+def test_replaced_parent_marker_is_not_moved_or_deleted(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    directory = tmp_path / "new"
+    marker = _state_directory_marker(directory)
+    original_fsync_directory = _fsync_directory
+    replaced = False
+
+    def replace_after_validation(path: Path) -> None:
+        nonlocal replaced
+        if path == tmp_path and not replaced:
+            replaced = True
+            marker.unlink()
+            marker.write_text("unrelated", encoding="utf-8")
+        original_fsync_directory(path)
+
+    monkeypatch.setattr(
+        "pa2bridge.mqtt_bridge._fsync_directory",
+        replace_after_validation,
+    )
+
+    with pytest.raises(DiscoveryStateError, match="invalid.*marker"):
+        _save_discovery_topics(
+            directory / "discovery.json",
+            frozenset(
+                {"homeassistant/select/driverack_pa2_host/preset/config"}
+            ),
+        )
+
+    assert marker.read_text(encoding="utf-8") == "unrelated"
+    assert not _state_directory_inner_marker(directory).exists()
+
+
+def test_replaced_inner_marker_is_not_deleted(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    directory = tmp_path / "new"
+    directory.mkdir()
+    marker = _state_directory_inner_marker(directory)
+    marker.symlink_to(_marker_payload(directory))
+    original_fsync_directory = _fsync_directory
+    replaced = False
+
+    def replace_after_validation(path: Path) -> None:
+        nonlocal replaced
+        if path == tmp_path and not replaced:
+            replaced = True
+            marker.unlink()
+            marker.write_text("unrelated", encoding="utf-8")
+        original_fsync_directory(path)
+
+    monkeypatch.setattr(
+        "pa2bridge.mqtt_bridge._fsync_directory",
+        replace_after_validation,
+    )
+
+    with pytest.raises(DiscoveryStateError, match="invalid.*marker"):
+        _save_discovery_topics(
+            directory / "discovery.json",
+            frozenset(
+                {"homeassistant/select/driverack_pa2_host/preset/config"}
+            ),
+        )
+
+    assert marker.read_text(encoding="utf-8") == "unrelated"
+
+
+def test_inner_state_directory_marker_is_recovered_after_rename_fsync_failure(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    directory = tmp_path / "new"
+    state_path = directory / "discovery.json"
+    original_fsync_directory = _fsync_directory
+    parent_attempts = 0
+
+    def fail_after_marker_move(path: Path) -> None:
+        nonlocal parent_attempts
+        if path == tmp_path:
+            parent_attempts += 1
+            if parent_attempts == 3:
+                raise OSError("marker move fsync failed")
+        original_fsync_directory(path)
+
+    monkeypatch.setattr(
+        "pa2bridge.mqtt_bridge._fsync_directory",
+        fail_after_marker_move,
+    )
+    topics = frozenset(
+        {"homeassistant/select/driverack_pa2_host/preset/config"}
+    )
+
+    with pytest.raises(DiscoveryStateError, match="marker move fsync failed"):
+        _save_discovery_topics(state_path, topics)
+    inner_marker = _state_directory_inner_marker(directory)
+    assert inner_marker.is_symlink()
+
+    _save_discovery_topics(state_path, topics)
+
+    assert state_path.exists()
+    assert not inner_marker.exists() and not inner_marker.is_symlink()
 
 
 def test_failed_ancestor_directory_fsync_is_retried(
@@ -606,11 +817,14 @@ def test_failed_ancestor_directory_fsync_is_retried(
     original_fsync_directory = _fsync_directory
     attempts: list[Path] = []
     failed = False
+    tmp_path_attempts = 0
 
     def fail_once(path: Path) -> None:
-        nonlocal failed
+        nonlocal failed, tmp_path_attempts
         attempts.append(path)
-        if path == tmp_path and not failed:
+        if path == tmp_path:
+            tmp_path_attempts += 1
+        if path == tmp_path and tmp_path_attempts == 2 and not failed:
             failed = True
             raise OSError("ancestor fsync failed")
         original_fsync_directory(path)
@@ -625,9 +839,13 @@ def test_failed_ancestor_directory_fsync_is_retried(
 
     with pytest.raises(DiscoveryStateError, match="ancestor fsync failed"):
         _save_discovery_topics(state_path, topics)
+    assert (tmp_path / "new").is_dir()
+    assert list(tmp_path.glob(".pa2bridge-state-dir-*.pending"))
+    attempts.clear()
     _save_discovery_topics(state_path, topics)
 
-    assert attempts.count(tmp_path) == 2
+    assert tmp_path in attempts
+    assert not list(tmp_path.glob(".pa2bridge-state-dir-*.pending"))
 
 
 def test_visible_manifest_after_parent_fsync_failure_is_resaved_before_publish(
@@ -641,14 +859,13 @@ def test_visible_manifest_after_parent_fsync_failure_is_resaved_before_publish(
     )
     bridge._connect_pa2()
     original_fsync_directory = _fsync_directory
-    parent_fsyncs = 0
+    failed = False
 
     def fail_final_parent_fsync(path: Path) -> None:
-        nonlocal parent_fsyncs
-        if path == tmp_path:
-            parent_fsyncs += 1
-            if parent_fsyncs == 2:
-                raise OSError("final parent fsync failed")
+        nonlocal failed
+        if path == tmp_path and state_path.exists() and not failed:
+            failed = True
+            raise OSError("final parent fsync failed")
         original_fsync_directory(path)
 
     monkeypatch.setattr(

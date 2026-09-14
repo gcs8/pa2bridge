@@ -4,7 +4,10 @@ import importlib
 import json
 import sys
 from contextlib import contextmanager
+from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 from pa2bridge import cli
 from pa2bridge.controller import DeviceIdentity, Pa2State, Preset, TelemetryError
@@ -115,6 +118,25 @@ def test_mute_uses_verified_controller_operation(monkeypatch, capsys) -> None:
         "action": "mute",
         "verified": True,
     }
+
+
+@pytest.mark.parametrize("xdg_state_home", ["", "relative/state"])
+def test_daemon_ignores_invalid_xdg_state_home(monkeypatch, xdg_state_home) -> None:
+    monkeypatch.setenv("XDG_STATE_HOME", xdg_state_home)
+
+    args = cli.build_parser().parse_args(["daemon"])
+
+    assert args.discovery_state == (
+        Path.home() / ".local/state/pa2bridge/discovery.json"
+    )
+
+
+def test_daemon_uses_absolute_xdg_state_home(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+
+    args = cli.build_parser().parse_args(["daemon"])
+
+    assert args.discovery_state == tmp_path / "pa2bridge/discovery.json"
 
 
 def test_telemetry_error_uses_the_cli_json_error_contract(monkeypatch, capsys) -> None:

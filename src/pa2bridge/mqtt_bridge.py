@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
 import re
+import stat
 import tempfile
 import threading
 import time
@@ -158,16 +160,91 @@ def _ensure_state_directory(path: Path) -> None:
     while not candidate.exists():
         missing.append(candidate)
         candidate = candidate.parent
+    if not candidate.is_dir():
+        raise NotADirectoryError(candidate)
+    if candidate.parent != candidate and _state_directory_pending(candidate):
+        _create_state_directory(candidate)
     for directory in reversed(missing):
-        directory.mkdir(mode=0o700)
+        _create_state_directory(directory)
 
 
-def _fsync_directory_chain(path: Path) -> None:
-    directories = [path]
-    while directories[-1].parent != directories[-1]:
-        directories.append(directories[-1].parent)
-    for directory in reversed(directories):
+def _state_directory_marker(directory: Path) -> Path:
+    digest = hashlib.sha256(os.fsencode(directory.name)).hexdigest()[:16]
+    return directory.parent / f".pa2bridge-state-dir-{digest}.pending"
+
+
+def _state_directory_inner_marker(directory: Path) -> Path:
+    return directory / ".pa2bridge-state-directory.pending"
+
+
+def _marker_payload(directory: Path) -> str:
+    identity = hashlib.sha256(os.fsencode(os.path.abspath(directory))).hexdigest()
+    return f"pa2bridge-state-directory-v1:{identity}"
+
+
+def _entry_exists(path: Path) -> bool:
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def _state_directory_pending(directory: Path) -> bool:
+    return _entry_exists(_state_directory_marker(directory)) or _entry_exists(
+        _state_directory_inner_marker(directory)
+    )
+
+
+def _validate_state_directory_marker(marker: Path, payload: str) -> None:
+    metadata = marker.lstat()
+    if (
+        not stat.S_ISLNK(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or os.readlink(marker) != payload
+    ):
+        raise OSError("invalid discovery state directory marker")
+
+
+def _install_state_directory_marker(marker: Path, payload: str) -> None:
+    try:
+        marker.symlink_to(payload)
+    except FileExistsError:
+        pass
+    _validate_state_directory_marker(marker, payload)
+
+
+def _create_state_directory(directory: Path) -> None:
+    marker = _state_directory_marker(directory)
+    inner_marker = _state_directory_inner_marker(directory)
+    payload = _marker_payload(directory)
+    parent_pending = _entry_exists(marker)
+    inner_pending = directory.is_dir() and _entry_exists(inner_marker)
+    if parent_pending and inner_pending:
+        raise OSError("duplicate discovery state directory markers")
+    if inner_pending:
+        _validate_state_directory_marker(inner_marker, payload)
+        _fsync_directory(directory.parent)
         _fsync_directory(directory)
+        _validate_state_directory_marker(inner_marker, payload)
+        inner_marker.unlink()
+        return
+    _install_state_directory_marker(marker, payload)
+    _fsync_directory(directory.parent)
+    try:
+        directory.mkdir(mode=0o700)
+    except FileExistsError:
+        if not directory.is_dir():
+            raise NotADirectoryError(directory)
+    _fsync_directory(directory.parent)
+    if _entry_exists(inner_marker):
+        raise OSError("unexpected discovery state directory marker")
+    _validate_state_directory_marker(marker, payload)
+    os.replace(marker, inner_marker)
+    _fsync_directory(directory.parent)
+    _fsync_directory(directory)
+    _validate_state_directory_marker(inner_marker, payload)
+    inner_marker.unlink()
 
 
 def _save_discovery_topics(path: Path, topics: frozenset[str]) -> None:
@@ -192,7 +269,6 @@ def _save_discovery_topics(path: Path, topics: frozenset[str]) -> None:
     cleanup_error: OSError | None = None
     try:
         _ensure_state_directory(path.parent)
-        _fsync_directory_chain(path.parent)
         descriptor, temporary_path = tempfile.mkstemp(
             prefix=f".{path.name}.",
             dir=path.parent,
