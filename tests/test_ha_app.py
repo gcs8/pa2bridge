@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import subprocess
@@ -13,7 +14,7 @@ import pytest
 
 from pa2bridge import __version__
 from pa2bridge.config import ConfigError
-from pa2bridge.ha_app import load_ha_app_config
+from pa2bridge.ha_app import main, load_ha_app_config
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -47,6 +48,36 @@ def _options(**overrides: object) -> dict[str, object]:
 
 def _write_options(path: Path, options: dict[str, object]) -> None:
     path.write_text(json.dumps(options), encoding="utf-8")
+
+
+def test_main_reports_config_error_without_traceback(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    for key, value in MQTT_ENV.items():
+        monkeypatch.setenv(key, value)
+    path = tmp_path / "options.json"
+    _write_options(path, _options(pa2_port="19272"))
+    caplog.set_level(logging.ERROR, logger="pa2bridge.ha_app")
+
+    assert main(["--options", str(path)]) == 2
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "Traceback" not in captured.err
+    assert json.loads(captured.err) == {
+        "error": "Home Assistant option pa2_port must be an integer from 1 through 65535",
+        "verified": False,
+    }
+    error_records = [
+        record for record in caplog.records if record.levelno == logging.ERROR
+    ]
+    assert len(error_records) == 1
+    assert error_records[0].getMessage() == (
+        "Home Assistant option pa2_port must be an integer from 1 through 65535"
+    )
 
 
 def test_load_ha_app_config_uses_supervisor_options_and_mqtt_service(tmp_path: Path) -> None:

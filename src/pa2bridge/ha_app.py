@@ -8,14 +8,15 @@ import logging
 import math
 import os
 import re
+import sys
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
 from .config import (
+    MAX_RECALL_TIMEOUT_SECONDS,
     AppConfig,
     ConfigError,
-    MAX_RECALL_TIMEOUT_SECONDS,
     MqttConfig,
     Pa2Config,
     has_disallowed_mqtt_codepoint,
@@ -27,6 +28,8 @@ from .config import (
 )
 from .mqtt_bridge import MqttBridge
 
+
+LOGGER = logging.getLogger(__name__)
 
 _ALLOWED_OPTION_KEYS = {
     "allowed_preset_slots",
@@ -280,8 +283,13 @@ def main(argv: list[str] | None = None) -> int:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-    MqttBridge(load_ha_app_config(args.options)).run_forever()
-    return 0
+    try:
+        MqttBridge(load_ha_app_config(args.options)).run_forever()
+        return 0
+    except ConfigError as error:
+        LOGGER.error("%s", error)
+        print(json.dumps({"error": str(error), "verified": False}), file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":
