@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import signal
 import threading
 import time
 from dataclasses import dataclass
@@ -340,10 +341,30 @@ class MqttBridge:
         self._diagnostics: Queue[str] = Queue(maxsize=1)
 
     def run_forever(self) -> None:
+        self._mqtt_ready.clear()
+        self._stop_event.clear()
+        previous_sigterm_handler = None
+        if threading.current_thread() is threading.main_thread():
+            previous_sigterm_handler = signal.signal(
+                signal.SIGTERM,
+                self._handle_sigterm,
+            )
+        try:
+            self._run_forever()
+        finally:
+            if previous_sigterm_handler is not None:
+                signal.signal(signal.SIGTERM, previous_sigterm_handler)
+
+    def _handle_sigterm(self, signum: int, frame: object) -> None:
+        del signum, frame
+        LOGGER.info("stopping after SIGTERM")
+        self._stop_event.set()
+        self._mqtt_ready.set()
+        self._mqtt_state_changed.set()
+
+    def _run_forever(self) -> None:
         loop_started = False
         try:
-            self._mqtt_ready.clear()
-            self._stop_event.clear()
             self.mqtt.connect(
                 self.config.mqtt.host,
                 self.config.mqtt.port,

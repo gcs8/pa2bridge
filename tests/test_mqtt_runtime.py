@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import signal
 import threading
 import time
 from types import SimpleNamespace
@@ -1195,6 +1196,41 @@ def test_run_forever_releases_pa2_lock_before_stopping_mqtt_loop(monkeypatch) ->
     bridge.run_forever()
 
     assert client.loop_stopped == 1
+
+
+def test_run_forever_installs_and_restores_graceful_sigterm_handler(monkeypatch) -> None:
+    bridge, client, pa2, _ = make_bridge(monkeypatch)
+    monkeypatch.setattr(bridge, "_connect_pa2", lambda: setattr(pa2, "connected", True))
+    registrations: list[tuple[int, object]] = []
+    previous_handler = signal.SIG_DFL
+    original_loop_start = client.loop_start
+
+    def record_signal(signum: int, handler: object) -> object:
+        registrations.append((signum, handler))
+        return previous_handler
+
+    def stop_after_mqtt_start() -> None:
+        original_loop_start()
+        assert registrations
+        bridge._mqtt_ready.clear()
+        bridge._mqtt_state_changed.clear()
+        registrations[0][1](signal.SIGTERM, None)  # type: ignore[operator]
+
+    monkeypatch.setattr(signal, "signal", record_signal)
+    client.loop_start = stop_after_mqtt_start  # type: ignore[method-assign]
+
+    bridge.run_forever()
+
+    assert len(registrations) == 2
+    signum, _ = registrations[0]
+    assert signum == signal.SIGTERM
+    assert registrations[1] == (signal.SIGTERM, previous_handler)
+    assert bridge._stop_event.is_set()
+    assert bridge._mqtt_ready.is_set()
+    assert bridge._mqtt_state_changed.is_set()
+    assert client.loop_stopped == 1
+    assert client.disconnected == 1
+    assert pa2.closed == 1
 
 
 def test_unacknowledged_shutdown_publication_fails_closed(monkeypatch) -> None:

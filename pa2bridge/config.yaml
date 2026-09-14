@@ -8,6 +8,7 @@ arch:
   - aarch64
 init: false
 stage: experimental
+timeout: 45
 breaking_versions:
   - "0.1.2"
 services:

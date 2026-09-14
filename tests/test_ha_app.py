@@ -311,6 +311,7 @@ def test_home_assistant_app_metadata_is_bounded_and_requires_mqtt() -> None:
     assert "slug: pa2bridge" in config
     assert "- mqtt:need" in config
     assert "preset_slots: auto" in config
+    assert "timeout: 45" in config
     assert "preset_slots: str" in config
     assert 'pa2_password_override: ""' in config
     assert 'pa2_password_override: password' in config
@@ -323,6 +324,12 @@ def test_home_assistant_app_metadata_is_bounded_and_requires_mqtt() -> None:
     assert "homeassistant_api: true" not in config
     assert "privileged:" not in config
     assert 'recall_timeout: "float(0.1,20)"' in config
+
+
+def test_systemd_stop_timeout_allows_bounded_graceful_shutdown() -> None:
+    service = (PROJECT_ROOT / "deploy" / "pa2bridge.service").read_text()
+
+    assert "TimeoutStopSec=45s" in service
 
 
 def test_public_install_shape_is_a_supervisor_managed_app_not_hacs() -> None:
