@@ -4,15 +4,24 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import re
+import tempfile
 import threading
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from queue import Empty, Full, Queue
 from typing import Any
 
 import paho.mqtt.client as mqtt
 
-from .config import AppConfig, MQTT_KEEPALIVE_SECONDS
+from .config import (
+    MQTT_KEEPALIVE_SECONDS,
+    AppConfig,
+    ConfigError,
+    validate_mqtt_topic_prefix,
+)
 from .controller import (
     DeviceIdentity,
     INPUT_CLIPS,
@@ -32,10 +41,199 @@ from .protocol import HiQnetClient, ProtocolError
 LOGGER = logging.getLogger(__name__)
 DETAIL_REFRESH_INTERVAL = 60.0
 SHUTDOWN_PUBLISH_TIMEOUT = 5.0
+_MAX_DISCOVERY_STATE_BYTES = 64 * 1024
+_MAX_DISCOVERY_TOPICS = 100
+_DISCOVERY_NODE = re.compile(r"driverack_pa2_[A-Za-z0-9_-]{1,253}", re.ASCII)
+_DISCOVERY_OBJECTS = frozenset(
+    {
+        ("select", "preset"),
+        ("button", "unmute_outputs"),
+        ("sensor", "firmware"),
+        ("sensor", "last_command"),
+        ("sensor", "preset_inventory"),
+        ("sensor", "crossover"),
+        *(("switch", f"{channel}_mute") for channel in OUTPUT_MUTES),
+        *(("sensor", f"{side}_input_level") for side in INPUT_LEVELS),
+        *(("binary_sensor", f"{side}_input_clip") for side in INPUT_CLIPS),
+        *(("sensor", f"{channel}_output_level") for channel in OUTPUT_LEVELS),
+    }
+)
 
 
 class MqttPublishError(RuntimeError):
     """The broker did not accept a required state or availability update."""
+
+
+class DiscoveryStateError(RuntimeError):
+    """Persisted MQTT discovery ownership state was missing or unsafe."""
+
+
+def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise DiscoveryStateError(f"duplicate discovery state key: {key}")
+        result[key] = value
+    return result
+
+
+def _validate_discovery_topic(topic: Any) -> str:
+    try:
+        validated = validate_mqtt_topic_prefix(
+            topic,
+            description="persisted discovery topic",
+        )
+    except ConfigError as error:
+        raise DiscoveryStateError(
+            "discovery state contains an invalid topic"
+        ) from error
+    parts = validated.split("/")
+    if len(parts) < 5:
+        raise DiscoveryStateError("discovery state contains an invalid topic")
+    component, node, object_id, suffix = parts[-4:]
+    if (
+        suffix != "config"
+        or _DISCOVERY_NODE.fullmatch(node) is None
+        or (component, object_id) not in _DISCOVERY_OBJECTS
+        or len(validated.encode("utf-8")) > 65_535
+    ):
+        raise DiscoveryStateError("discovery state contains an invalid topic")
+    return validated
+
+
+def _load_discovery_topics(path: Path | None) -> frozenset[str]:
+    if path is None:
+        return frozenset()
+    try:
+        with path.open("rb") as handle:
+            raw = handle.read(_MAX_DISCOVERY_STATE_BYTES + 1)
+    except FileNotFoundError:
+        return frozenset()
+    except OSError as error:
+        raise DiscoveryStateError(f"could not read discovery state: {error}") from error
+    if len(raw) > _MAX_DISCOVERY_STATE_BYTES:
+        raise DiscoveryStateError("discovery state exceeds its size limit")
+    try:
+        value = json.loads(
+            raw.decode("utf-8"), object_pairs_hook=_reject_duplicate_json_keys
+        )
+    except DiscoveryStateError:
+        raise
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise DiscoveryStateError(f"could not parse discovery state: {error}") from error
+    if not isinstance(value, dict) or set(value) != {"version", "topics"}:
+        raise DiscoveryStateError("discovery state has an invalid schema")
+    if type(value["version"]) is not int or value["version"] != 1:
+        raise DiscoveryStateError("discovery state has an unsupported version")
+    topics = value["topics"]
+    if not isinstance(topics, list) or len(topics) > _MAX_DISCOVERY_TOPICS:
+        raise DiscoveryStateError("discovery state has an invalid topic list")
+    validated = tuple(_validate_discovery_topic(topic) for topic in topics)
+    if len(set(validated)) != len(validated):
+        raise DiscoveryStateError("discovery state contains duplicate topics")
+    return frozenset(validated)
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    sync_error: OSError | None = None
+    close_error: OSError | None = None
+    try:
+        os.fsync(descriptor)
+    except OSError as error:
+        sync_error = error
+    try:
+        os.close(descriptor)
+    except OSError as error:
+        close_error = error
+    if sync_error is not None:
+        raise sync_error
+    if close_error is not None:
+        raise close_error
+
+
+def _ensure_state_directory(path: Path) -> None:
+    missing: list[Path] = []
+    candidate = path
+    while not candidate.exists():
+        missing.append(candidate)
+        candidate = candidate.parent
+    for directory in reversed(missing):
+        directory.mkdir(mode=0o700)
+
+
+def _fsync_directory_chain(path: Path) -> None:
+    directories = [path]
+    while directories[-1].parent != directories[-1]:
+        directories.append(directories[-1].parent)
+    for directory in reversed(directories):
+        _fsync_directory(directory)
+
+
+def _save_discovery_topics(path: Path, topics: frozenset[str]) -> None:
+    if len(topics) > _MAX_DISCOVERY_TOPICS:
+        raise DiscoveryStateError("discovery state has too many owned topics")
+    validated_topics = frozenset(
+        _validate_discovery_topic(topic) for topic in topics
+    )
+    payload = (
+        json.dumps(
+            {"version": 1, "topics": sorted(validated_topics)},
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        + "\n"
+    ).encode("utf-8")
+    if len(payload) > _MAX_DISCOVERY_STATE_BYTES:
+        raise DiscoveryStateError("discovery state exceeds its size limit")
+    descriptor: int | None = None
+    temporary_path: str | None = None
+    write_error: OSError | None = None
+    cleanup_error: OSError | None = None
+    try:
+        _ensure_state_directory(path.parent)
+        _fsync_directory_chain(path.parent)
+        descriptor, temporary_path = tempfile.mkstemp(
+            prefix=f".{path.name}.",
+            dir=path.parent,
+        )
+        os.fchmod(descriptor, 0o600)
+        remaining = memoryview(payload)
+        while remaining:
+            written = os.write(descriptor, remaining)
+            if written <= 0:
+                raise OSError("discovery state write made no progress")
+            remaining = remaining[written:]
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = None
+        os.replace(temporary_path, path)
+        temporary_path = None
+        _fsync_directory(path.parent)
+    except OSError as error:
+        write_error = error
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError as error:
+                cleanup_error = error
+        if temporary_path is not None:
+            try:
+                os.unlink(temporary_path)
+            except FileNotFoundError:
+                pass
+            except OSError as error:
+                if cleanup_error is None:
+                    cleanup_error = error
+    if write_error is not None:
+        raise DiscoveryStateError(
+            f"could not write discovery state: {write_error}"
+        ) from write_error
+    if cleanup_error is not None:
+        raise DiscoveryStateError(
+            f"could not clean up discovery state: {cleanup_error}"
+        ) from cleanup_error
 
 
 @dataclass(frozen=True)
@@ -282,8 +480,17 @@ def build_discovery_messages(
 class MqttBridge:
     """Owns the authoritative PA2 session and maps MQTT commands to verified operations."""
 
-    def __init__(self, config: AppConfig) -> None:
+    def __init__(
+        self,
+        config: AppConfig,
+        *,
+        discovery_state_path: Path | None = None,
+    ) -> None:
         self.config = config
+        self.discovery_state_path = discovery_state_path
+        self._persisted_discovery_topics = _load_discovery_topics(
+            discovery_state_path
+        )
         self.pa2_client = HiQnetClient(
             config.pa2.host,
             port=config.pa2.port,
@@ -517,10 +724,7 @@ class MqttBridge:
                     discovery_prefix=self.config.mqtt.discovery_prefix,
                     expose_meters=self.config.mqtt.expose_meters,
                 )
-                for message in refreshed_discovery:
-                    self._publish(
-                        message.topic, message.payload, retain=message.retain
-                    )
+                self._publish_discovery(refreshed_discovery)
                 self.discovery = refreshed_discovery
                 self._preset_commands = allowed_commands
                 self._discovery_published = True
@@ -595,10 +799,7 @@ class MqttBridge:
                     self._connect_pa2()
                 identity = self._identity_for_connection()
                 if not self._discovery_published:
-                    for message in self.discovery:
-                        self._publish(
-                            message.topic, message.payload, retain=message.retain
-                        )
+                    self._publish_discovery(self.discovery)
                     self._discovery_published = True
                 state = self.controller.state(identity=identity)
                 now = time.monotonic()
@@ -941,6 +1142,74 @@ class MqttBridge:
                 raise error
         return result
 
+    def _publish_discovery(self, messages: list[MqttPublish]) -> None:
+        deadline = time.monotonic() + SHUTDOWN_PUBLISH_TIMEOUT
+        validated_messages = [
+            MqttPublish(
+                topic=_validate_discovery_topic(message.topic),
+                payload=message.payload,
+                retain=message.retain,
+            )
+            for message in messages
+        ]
+        current_topics = frozenset(
+            message.topic for message in validated_messages if message.payload
+        )
+        pending_topics = self._persisted_discovery_topics | current_topics
+        if self.discovery_state_path is not None:
+            _save_discovery_topics(self.discovery_state_path, pending_topics)
+        self._persisted_discovery_topics = pending_topics
+        stale_topics = sorted(self._persisted_discovery_topics - current_topics)
+        cleanup_results = [
+            (topic, self._publish(topic, "", retain=True)) for topic in stale_topics
+        ]
+        self._wait_for_discovery_publications(cleanup_results, deadline=deadline)
+        current_results = [
+            (
+                message.topic,
+                self._publish(
+                    message.topic,
+                    message.payload,
+                    retain=message.retain,
+                ),
+            )
+            for message in validated_messages
+        ]
+        self._wait_for_discovery_publications(current_results, deadline=deadline)
+        if (
+            self.discovery_state_path is not None
+            and current_topics != self._persisted_discovery_topics
+        ):
+            _save_discovery_topics(self.discovery_state_path, current_topics)
+        self._persisted_discovery_topics = current_topics
+
+    def _wait_for_discovery_publications(
+        self,
+        publications,
+        *,
+        deadline: float,
+    ) -> None:
+        for topic, result in publications:
+            remaining = deadline - time.monotonic()
+            if result is None or remaining <= 0:
+                raise self._publication_timeout(topic)
+            self._wait_for_publication(
+                result,
+                topic=topic,
+                timeout=remaining,
+            )
+            if time.monotonic() >= deadline:
+                raise self._publication_timeout(topic)
+
+    def _publication_timeout(self, topic: str) -> MqttPublishError:
+        failure = MqttPublishError(
+            f"MQTT publication acknowledgement timed out for {topic}"
+        )
+        self._mqtt_connected = False
+        self._mqtt_failure = failure
+        self._stop_event.set()
+        return failure
+
     def _publish_checked(self, topic: str, payload: str, *, retain: bool):
         """Publish without the command-session fence, for bounded shutdown use."""
         try:
@@ -954,9 +1223,15 @@ class MqttBridge:
             )
         return result
 
-    def _wait_for_publication(self, result: Any, *, topic: str) -> None:
+    def _wait_for_publication(
+        self,
+        result: Any,
+        *,
+        topic: str,
+        timeout: float = SHUTDOWN_PUBLISH_TIMEOUT,
+    ) -> None:
         try:
-            result.wait_for_publish(timeout=SHUTDOWN_PUBLISH_TIMEOUT)
+            result.wait_for_publish(timeout=timeout)
             published = result.is_published()
         except Exception as error:
             failure = MqttPublishError(
@@ -967,10 +1242,4 @@ class MqttBridge:
             self._stop_event.set()
             raise failure from error
         if not published:
-            failure = MqttPublishError(
-                f"MQTT publication acknowledgement timed out for {topic}"
-            )
-            self._mqtt_connected = False
-            self._mqtt_failure = failure
-            self._stop_event.set()
-            raise failure
+            raise self._publication_timeout(topic)

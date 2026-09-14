@@ -82,6 +82,8 @@ The app package lives in [`pa2bridge/`](pa2bridge/). After a reviewed release im
 
 The app requests Home Assistant's `mqtt:need` service and receives dedicated broker credentials from Supervisor. PA2 and MQTT secrets are not placed in Git or Stream Deck profiles.
 
+The app keeps its MQTT discovery-topic manifest in `/data/discovery.json`. On startup or an identity/configuration change, it clears retained topics no longer owned by the current PA2 device before publishing the current discovery records. Do not remove this file independently of broker cleanup; malformed state stops startup rather than risking deletion of an unverified topic.
+
 Upgrading from v0.1.1 requires a manual update because the configuration fields changed. Factory-password users can leave `pa2_password_override` blank. Users with a custom PA2 password must re-enter it in that field before starting v0.1.2 or newer. A retained restrictive legacy `allowed_preset_slots` list remains the active narrower restriction while `preset_slots` is `auto`. If both fields contain explicit lists, PA2Bridge accepts equivalent slot sets regardless of order and rejects differing restrictions instead of widening recall scope.
 
 `recall_timeout` is limited to 20 seconds. This preserves a 10-second margin below the bridge's 30-second MQTT keepalive while the final broker-session authorization lock is held across a PA2 transaction.
@@ -160,7 +162,7 @@ pa2bridge --config ~/.config/pa2bridge/config.toml activate 2 --no-unmute
 pa2bridge --config ~/.config/pa2bridge/config.toml unmute
 pa2bridge --config ~/.config/pa2bridge/config.toml mute
 
-# MQTT/Home Assistant bridge
+# MQTT/Home Assistant bridge (state path defaults under ~/.local/state)
 pa2bridge --config ~/.config/pa2bridge/config.toml daemon
 ```
 
@@ -177,7 +179,7 @@ systemctl --user status pa2bridge.service
 journalctl --user -u pa2bridge.service -n 100 --no-pager
 ```
 
-The supplied fallback service is restart-on-failure, uses the environment file above, and publishes MQTT `offline` through both explicit shutdown and broker LWT behavior. Never enable it while the Home Assistant App is running.
+The supplied fallback service is restart-on-failure, uses the environment file above, persists its discovery manifest in the systemd user state directory, and publishes MQTT `offline` through both explicit shutdown and broker LWT behavior. Never enable it while the Home Assistant App is running.
 
 ### Stop or roll back the deployment
 

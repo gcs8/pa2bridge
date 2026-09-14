@@ -133,10 +133,15 @@ def test_telemetry_error_uses_the_cli_json_error_contract(monkeypatch, capsys) -
     assert error == {"error": "invalid device telemetry", "verified": False}
 
 
-def test_mqtt_publish_error_uses_the_cli_json_error_contract(monkeypatch, capsys) -> None:
+def test_mqtt_publish_error_uses_the_cli_json_error_contract(
+    monkeypatch, capsys, tmp_path
+) -> None:
+    state_path = tmp_path / "discovery.json"
+
     class FailedBridge:
-        def __init__(self, config) -> None:
+        def __init__(self, config, **kwargs) -> None:
             del config
+            assert kwargs == {"discovery_state_path": state_path}
 
         def run_forever(self) -> None:
             raise MqttPublishError("broker rejected publication")
@@ -144,7 +149,15 @@ def test_mqtt_publish_error_uses_the_cli_json_error_contract(monkeypatch, capsys
     monkeypatch.setattr(cli, "load_config", lambda path: SimpleNamespace())
     monkeypatch.setattr(cli, "MqttBridge", FailedBridge)
 
-    assert cli.main(["--config", "ignored.toml", "daemon"]) == 2
+    assert cli.main(
+        [
+            "--config",
+            "ignored.toml",
+            "daemon",
+            "--discovery-state",
+            str(state_path),
+        ]
+    ) == 2
 
     error = json.loads(capsys.readouterr().err.splitlines()[-1])
     assert error == {"error": "broker rejected publication", "verified": False}

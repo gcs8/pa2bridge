@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from pa2bridge import __version__
+from pa2bridge import __version__, ha_app
 from pa2bridge.config import ConfigError
 from pa2bridge.ha_app import main, load_ha_app_config
 
@@ -78,6 +78,55 @@ def test_main_reports_config_error_without_traceback(
     assert error_records[0].getMessage() == (
         "Home Assistant option pa2_port must be an integer from 1 through 65535"
     )
+
+
+def test_main_uses_durable_app_discovery_state(monkeypatch, tmp_path: Path) -> None:
+    path = tmp_path / "options.json"
+    _write_options(path, _options())
+    for key, value in MQTT_ENV.items():
+        monkeypatch.setenv(key, value)
+    calls: list[Path] = []
+
+    class FakeBridge:
+        def __init__(self, config, *, discovery_state_path: Path) -> None:
+            del config
+            calls.append(discovery_state_path)
+
+        def run_forever(self) -> None:
+            pass
+
+    monkeypatch.setattr(ha_app, "MqttBridge", FakeBridge)
+
+    assert ha_app.main(["--options", str(path)]) == 0
+    assert calls == [Path("/data/discovery.json")]
+
+
+def test_main_reports_mqtt_publish_error_without_traceback(
+    monkeypatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    path = tmp_path / "options.json"
+    _write_options(path, _options())
+    for key, value in MQTT_ENV.items():
+        monkeypatch.setenv(key, value)
+
+    class FailedBridge:
+        def __init__(self, config, *, discovery_state_path: Path) -> None:
+            del config, discovery_state_path
+
+        def run_forever(self) -> None:
+            raise ha_app.MqttPublishError("broker rejected discovery")
+
+    monkeypatch.setattr(ha_app, "MqttBridge", FailedBridge)
+
+    assert ha_app.main(["--options", str(path)]) == 2
+    captured = capsys.readouterr()
+    assert "Traceback" not in captured.err
+    assert json.loads(captured.err) == {
+        "error": "broker rejected discovery",
+        "verified": False,
+    }
 
 
 def test_load_ha_app_config_uses_supervisor_options_and_mqtt_service(tmp_path: Path) -> None:

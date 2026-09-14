@@ -26,7 +26,7 @@ from .config import (
     validate_mqtt_topic_prefix,
     validate_network_host,
 )
-from .mqtt_bridge import MqttBridge
+from .mqtt_bridge import DiscoveryStateError, MqttBridge, MqttPublishError
 
 
 LOGGER = logging.getLogger(__name__)
@@ -284,9 +284,12 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     try:
-        MqttBridge(load_ha_app_config(args.options)).run_forever()
+        MqttBridge(
+            load_ha_app_config(args.options),
+            discovery_state_path=Path("/data/discovery.json"),
+        ).run_forever()
         return 0
-    except ConfigError as error:
+    except (ConfigError, DiscoveryStateError, MqttPublishError) as error:
         LOGGER.error("%s", error)
         print(json.dumps({"error": str(error), "verified": False}), file=sys.stderr)
         return 2

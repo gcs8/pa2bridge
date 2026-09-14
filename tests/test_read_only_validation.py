@@ -31,6 +31,14 @@ PA2_TEST_PASSWORD = "-".join(("pa2", "test", "credential"))
 MQTT_TEST_PASSWORD = "-".join(("mqtt", "test", "credential"))
 
 
+def successful_publish(*args, **kwargs):
+    del args, kwargs
+    return SimpleNamespace(
+        wait_for_publish=lambda timeout: None,
+        is_published=lambda: True,
+    )
+
+
 class FakeRawPa2Client:
     def __init__(
         self,
@@ -212,7 +220,7 @@ def test_validation_bridge_uses_the_exact_read_only_two_poll_budget(monkeypatch)
         make_config(), run_id="offline-test", pa2_client=raw
     )
     bridge._mqtt_connected = True
-    monkeypatch.setattr(bridge, "_publish", lambda *args, **kwargs: None)
+    monkeypatch.setattr(bridge, "_publish", successful_publish)
 
     bridge._poll_once()
     assert bridge._stop_event.is_set() is False
@@ -241,7 +249,7 @@ def test_validation_bridge_accepts_documented_catalog_metadata_combinations(
         make_config(), run_id="offline-test", pa2_client=raw
     )
     bridge._mqtt_connected = True
-    monkeypatch.setattr(bridge, "_publish", lambda *args, **kwargs: None)
+    monkeypatch.setattr(bridge, "_publish", successful_publish)
 
     bridge._poll_once()
     bridge._poll_once()
@@ -298,7 +306,7 @@ def test_forbidden_mqtt_input_prevents_a_success_report_after_poll_two(
         make_config(), run_id="offline-test", pa2_client=FakeRawPa2Client()
     )
     bridge._mqtt_connected = True
-    monkeypatch.setattr(bridge, "_publish", lambda *args, **kwargs: None)
+    monkeypatch.setattr(bridge, "_publish", successful_publish)
     bridge._poll_once()
     bridge._poll_once()
     message = SimpleNamespace(
@@ -321,7 +329,7 @@ def test_unexpected_mqtt_disconnect_prevents_a_success_report_after_poll_two(
     )
     bridge._mqtt_connected = True
     bridge._mqtt_transport_connected = True
-    monkeypatch.setattr(bridge, "_publish", lambda *args, **kwargs: None)
+    monkeypatch.setattr(bridge, "_publish", successful_publish)
     bridge._poll_once()
     bridge._poll_once()
 
@@ -340,7 +348,7 @@ def test_expected_shutdown_disconnect_preserves_a_complete_success_report(
     )
     bridge._mqtt_connected = True
     bridge._mqtt_transport_connected = True
-    monkeypatch.setattr(bridge, "_publish", lambda *args, **kwargs: None)
+    monkeypatch.setattr(bridge, "_publish", successful_publish)
     bridge._poll_once()
     bridge._poll_once()
     bridge._stopping = True
