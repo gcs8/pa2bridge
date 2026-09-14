@@ -12,6 +12,7 @@ from pa2bridge.protocol import (
     AuthenticationError,
     HiQnetClient,
     ProtocolError,
+    ProtocolStartDeadlineExpired,
     ProtocolTimeout,
     encode_path,
     parse_value_response,
@@ -473,6 +474,76 @@ def test_get_before_does_not_start_receive_after_controller_deadline(monkeypatch
 
     assert sock.recv_calls == 0
     assert sock.closed is True
+
+
+@pytest.mark.parametrize(
+    ("start_deadline", "operation_deadline"),
+    [(1.0, 10.0), (1.0, 1.0), (10.0, 1.0)],
+)
+def test_set_starting_before_classifies_every_pre_send_expiry(
+    monkeypatch,
+    start_deadline: float,
+    operation_deadline: float,
+) -> None:
+    clock = SimpleNamespace(now=2.0)
+
+    class RecordingSocket:
+        def __init__(self) -> None:
+            self.sent: list[bytes] = []
+            self.closed = False
+
+        def sendall(self, data: bytes) -> None:
+            self.sent.append(data)
+
+        def shutdown(self, how: int) -> None:
+            del how
+
+        def close(self) -> None:
+            self.closed = True
+
+    sock = RecordingSocket()
+    client = HiQnetClient("127.0.0.1", timeout=10)
+    client._socket = sock
+    monkeypatch.setattr("pa2bridge.protocol.time.monotonic", lambda: clock.now)
+
+    with pytest.raises(ProtocolStartDeadlineExpired):
+        client.set_starting_before(
+            ("Preset", "OutputGains", "SV", "HighLeftOutputMute"),
+            "On",
+            start_deadline=start_deadline,
+            deadline=operation_deadline,
+        )
+
+    assert sock.sent == []
+    assert sock.closed is True
+
+
+def test_set_started_before_deadline_finishes_under_operation_deadline(monkeypatch) -> None:
+    clock = SimpleNamespace(now=0.0)
+
+    class SlowSendSocket:
+        def __init__(self) -> None:
+            self.sent: list[bytes] = []
+
+        def sendall(self, data: bytes) -> None:
+            self.sent.append(data)
+            clock.now = 2.0
+
+    sock = SlowSendSocket()
+    client = HiQnetClient("127.0.0.1", timeout=10)
+    client._socket = sock
+    monkeypatch.setattr("pa2bridge.protocol.time.monotonic", lambda: clock.now)
+
+    client.set_starting_before(
+        ("Preset", "OutputGains", "SV", "HighLeftOutputMute"),
+        "On",
+        start_deadline=1.0,
+        deadline=10.0,
+    )
+
+    assert sock.sent == [
+        b'set "\\\\Preset\\OutputGains\\SV\\HighLeftOutputMute" "On"\n'
+    ]
 
 
 def test_reconnect_before_does_not_authenticate_after_controller_deadline(
