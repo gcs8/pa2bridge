@@ -33,6 +33,7 @@ from .protocol import HiQnetClient, ProtocolError
 LOGGER = logging.getLogger(__name__)
 DETAIL_REFRESH_INTERVAL = 60.0
 SHUTDOWN_PUBLISH_TIMEOUT = 5.0
+PA2_READ_CYCLE_TIMEOUT = 60.0
 
 
 class MqttPublishError(RuntimeError):
@@ -324,6 +325,7 @@ class MqttBridge:
         self._mqtt_ready = threading.Event()
         self._mqtt_state_changed = threading.Event()
         self._stop_event = threading.Event()
+        self._sigterm_requested = False
         self._mqtt_failure: MqttPublishError | None = None
         self._pending_subscribe_mid: int | None = None
         self._stopping = False
@@ -343,6 +345,7 @@ class MqttBridge:
     def run_forever(self) -> None:
         self._mqtt_ready.clear()
         self._stop_event.clear()
+        self._sigterm_requested = False
         previous_sigterm_handler = None
         if threading.current_thread() is threading.main_thread():
             previous_sigterm_handler = signal.signal(
@@ -357,10 +360,17 @@ class MqttBridge:
 
     def _handle_sigterm(self, signum: int, frame: object) -> None:
         del signum, frame
-        LOGGER.info("stopping after SIGTERM")
+        self._sigterm_requested = True
+
+    def _apply_pending_sigterm(self) -> bool:
+        if not self._sigterm_requested:
+            return False
+        if not self._stop_event.is_set():
+            LOGGER.info("stopping after SIGTERM")
         self._stop_event.set()
         self._mqtt_ready.set()
         self._mqtt_state_changed.set()
+        return True
 
     def _run_forever(self) -> None:
         loop_started = False
@@ -372,7 +382,11 @@ class MqttBridge:
             )
             self.mqtt.loop_start()
             loop_started = True
-            if not self._mqtt_ready.wait(timeout=10.0):
+            self._apply_pending_sigterm()
+            mqtt_ready = self._mqtt_ready.wait(timeout=10.0)
+            if self._apply_pending_sigterm():
+                return
+            if not mqtt_ready:
                 raise MqttPublishError("MQTT connection callback timed out")
             if self._mqtt_failure is not None:
                 raise self._mqtt_failure
@@ -388,7 +402,10 @@ class MqttBridge:
 
             next_poll = 0.0
             reconnect_delay = 1.0
-            while not self._stop_event.is_set():
+            while True:
+                self._apply_pending_sigterm()
+                if self._stop_event.is_set():
+                    break
                 if self._mqtt_failure is not None:
                     raise self._mqtt_failure
                 with self._mqtt_state_lock:
@@ -414,6 +431,7 @@ class MqttBridge:
                 next_poll = now + self.config.mqtt.state_poll_interval
                 try:
                     self._poll_once()
+                    self._apply_pending_sigterm()
                     reconnect_delay = 1.0
                 except (
                     ProtocolError,
@@ -423,6 +441,8 @@ class MqttBridge:
                     RecallTimeout,
                     TelemetryError,
                 ) as error:
+                    if self._apply_pending_sigterm():
+                        continue
                     LOGGER.warning("PA2 poll failed: %s", error)
                     self._stop_event.wait(timeout=reconnect_delay)
                     reconnect_delay = min(reconnect_delay * 2, 30.0)
@@ -467,17 +487,22 @@ class MqttBridge:
             with self._pa2_lock:
                 self.pa2_client.close()
 
-    def publish_state(self, state: Pa2State) -> None:
+    def publish_state(
+        self,
+        state: Pa2State,
+        *,
+        deadline: float | None = None,
+    ) -> None:
         with self._pa2_lock:
             if not self._mqtt_connected:
                 return
             levels = (
-                self.controller.output_levels()
+                self.controller.output_levels(deadline=deadline)
                 if self.config.mqtt.expose_meters
                 else {}
             )
             input_meters = (
-                self.controller.input_meters()
+                self.controller.input_meters(deadline=deadline)
                 if self.config.mqtt.expose_meters
                 else None
             )
@@ -515,14 +540,16 @@ class MqttBridge:
                     )
             self._publish(f"{base}/status", "online", retain=True)
 
-    def publish_details(self) -> None:
+    def publish_details(self, *, deadline: float | None = None) -> None:
         """Publish slow-changing read-only data needed for inventory and curves."""
 
         with self._pa2_lock:
             if not self._mqtt_connected:
                 return
-            allowed_presets, presets = self.controller.list_preset_views()
-            crossover = self.controller.crossover()
+            allowed_presets, presets = self.controller.list_preset_views(
+                deadline=deadline
+            )
+            crossover = self.controller.crossover(deadline=deadline)
             allowed_commands = frozenset(
                 preset.label for preset in allowed_presets
             )
@@ -589,9 +616,14 @@ class MqttBridge:
             )
             self._publish(f"{base}/status/details", "online", retain=True)
 
-    def _refresh_details(self, *, current_slot: int) -> bool:
+    def _refresh_details(
+        self,
+        *,
+        current_slot: int,
+        deadline: float | None = None,
+    ) -> bool:
         try:
-            self.publish_details()
+            self.publish_details(deadline=deadline)
         except MqttPublishError:
             self._details_valid = False
             raise
@@ -611,18 +643,19 @@ class MqttBridge:
 
     def _poll_once(self) -> None:
         with self._pa2_lock:
+            deadline = time.monotonic() + PA2_READ_CYCLE_TIMEOUT
             try:
                 reconnected = not self.pa2_client.connected
                 if reconnected:
-                    self._connect_pa2()
-                identity = self._identity_for_connection()
+                    self._connect_pa2(deadline=deadline)
+                identity = self._identity_for_connection(deadline=deadline)
                 if not self._discovery_published:
                     for message in self.discovery:
                         self._publish(
                             message.topic, message.payload, retain=message.retain
                         )
                     self._discovery_published = True
-                state = self.controller.state(identity=identity)
+                state = self.controller.state(identity=identity, deadline=deadline)
                 now = time.monotonic()
                 refresh_overdue = (
                     now - self._last_detail_refresh >= DETAIL_REFRESH_INTERVAL
@@ -647,13 +680,16 @@ class MqttBridge:
                 # If the observed preset changed, details are offline before
                 # exposing the new core preset so stale crossover data is
                 # never advertised as belonging to it.
-                self.publish_state(state)
+                self.publish_state(state, deadline=deadline)
                 refresh_details = (
                     invalidate_details
                     or refresh_overdue
                 )
                 if refresh_details:
-                    self._refresh_details(current_slot=state.current_preset.slot)
+                    self._refresh_details(
+                        current_slot=state.current_preset.slot,
+                        deadline=deadline,
+                    )
             except Exception:
                 self._details_valid = False
                 self._publish(
@@ -667,16 +703,22 @@ class MqttBridge:
                 self.pa2_client.close()
                 raise
 
-    def _connect_pa2(self) -> None:
+    def _connect_pa2(self, *, deadline: float | None = None) -> None:
         with self._pa2_lock:
+            if deadline is None:
+                deadline = time.monotonic() + PA2_READ_CYCLE_TIMEOUT
             self._pa2_identity = None
-            self.pa2_client.connect(self.config.pa2.username, self.config.pa2.password)
-            identity = self.controller.identity()
+            self.pa2_client.connect_before(
+                self.config.pa2.username,
+                self.config.pa2.password,
+                deadline=deadline,
+            )
+            identity = self.controller.identity(deadline=deadline)
             self._pa2_identity = (
                 self.pa2_client.connection_generation,
                 identity,
             )
-            presets = self.controller.list_presets()
+            presets = self.controller.list_presets(deadline=deadline)
             self._allowed_presets = tuple(presets)
             self._preset_commands = frozenset(preset.label for preset in presets)
             self.device = self._device_info(identity)
@@ -699,11 +741,17 @@ class MqttBridge:
             firmware=identity.firmware,
         )
 
-    def _identity_for_connection(self) -> DeviceIdentity:
+    def _identity_for_connection(
+        self,
+        *,
+        deadline: float | None = None,
+    ) -> DeviceIdentity:
+        if deadline is None:
+            deadline = time.monotonic() + PA2_READ_CYCLE_TIMEOUT
         generation = self.pa2_client.connection_generation
         cached = self._pa2_identity
         if cached is None or cached[0] != generation:
-            identity = self.controller.identity()
+            identity = self.controller.identity(deadline=deadline)
             self._pa2_identity = (generation, identity)
             self.device = self._device_info(identity)
             self.discovery = build_discovery_messages(
@@ -719,9 +767,14 @@ class MqttBridge:
             return identity
         return cached[1]
 
-    def _state_with_current_identity(self, state: Pa2State) -> Pa2State:
+    def _state_with_current_identity(
+        self,
+        state: Pa2State,
+        *,
+        deadline: float | None = None,
+    ) -> Pa2State:
         return Pa2State(
-            identity=self._identity_for_connection(),
+            identity=self._identity_for_connection(deadline=deadline),
             current_preset=state.current_preset,
             output_mutes=state.output_mutes,
         )
@@ -887,19 +940,32 @@ class MqttBridge:
                     self.pa2_client.close()
                     return
                 try:
+                    if self._apply_pending_sigterm():
+                        return
                     refresh_details = False
                     if command.topic == f"{base}/command/preset":
                         self._details_valid = False
                         self._publish(
                             f"{base}/status/details", "offline", retain=True
                         )
+                        identity = self._identity_for_connection()
+                        if self._apply_pending_sigterm():
+                            return
                         device_touched = True
                         state = self.controller.activate_preset(
                             command.payload,
                             unmute_after=True,
-                            identity=self._identity_for_connection(),
+                            identity=identity,
                         )
-                        state = self._state_with_current_identity(state)
+                        if self._apply_pending_sigterm():
+                            return
+                        post_command_deadline = (
+                            time.monotonic() + PA2_READ_CYCLE_TIMEOUT
+                        )
+                        state = self._state_with_current_identity(
+                            state,
+                            deadline=post_command_deadline,
+                        )
                         result = (
                             f"recalled {state.current_preset.label}; outputs verified unmuted"
                         )
@@ -907,8 +973,16 @@ class MqttBridge:
                     elif command.topic == f"{base}/command/unmute":
                         device_touched = True
                         self.controller.set_all_outputs_muted(False)
+                        if self._apply_pending_sigterm():
+                            return
+                        post_command_deadline = (
+                            time.monotonic() + PA2_READ_CYCLE_TIMEOUT
+                        )
                         state = self.controller.state(
-                            identity=self._identity_for_connection()
+                            identity=self._identity_for_connection(
+                                deadline=post_command_deadline
+                            ),
+                            deadline=post_command_deadline,
                         )
                         result = "all outputs verified unmuted"
                     else:
@@ -917,17 +991,30 @@ class MqttBridge:
                         self.controller.set_output_muted(
                             channel, command.payload == "On"
                         )
+                        if self._apply_pending_sigterm():
+                            return
+                        post_command_deadline = (
+                            time.monotonic() + PA2_READ_CYCLE_TIMEOUT
+                        )
                         state = self.controller.state(
-                            identity=self._identity_for_connection()
+                            identity=self._identity_for_connection(
+                                deadline=post_command_deadline
+                            ),
+                            deadline=post_command_deadline,
                         )
                         result = f"{channel} mute verified {command.payload}"
-                    self.publish_state(state)
+                    self.publish_state(state, deadline=post_command_deadline)
                     if refresh_details:
-                        self._refresh_details(current_slot=state.current_preset.slot)
+                        self._refresh_details(
+                            current_slot=state.current_preset.slot,
+                            deadline=post_command_deadline,
+                        )
                     self._publish(
                         f"{base}/state/last_command", result, retain=True
                     )
                 except Exception as error:
+                    if self._apply_pending_sigterm():
+                        return
                     LOGGER.error("command failed (%s)", type(error).__name__)
                     if device_touched:
                         try:

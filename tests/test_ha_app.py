@@ -13,8 +13,9 @@ from pathlib import Path
 import pytest
 
 from pa2bridge import __version__
-from pa2bridge.config import ConfigError
+from pa2bridge.config import ConfigError, MAX_RECALL_TIMEOUT_SECONDS
 from pa2bridge.ha_app import main, load_ha_app_config
+from pa2bridge.mqtt_bridge import PA2_READ_CYCLE_TIMEOUT, SHUTDOWN_PUBLISH_TIMEOUT
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -311,7 +312,7 @@ def test_home_assistant_app_metadata_is_bounded_and_requires_mqtt() -> None:
     assert "slug: pa2bridge" in config
     assert "- mqtt:need" in config
     assert "preset_slots: auto" in config
-    assert "timeout: 45" in config
+    assert "timeout: 75" in config
     assert "preset_slots: str" in config
     assert 'pa2_password_override: ""' in config
     assert 'pa2_password_override: password' in config
@@ -329,7 +330,11 @@ def test_home_assistant_app_metadata_is_bounded_and_requires_mqtt() -> None:
 def test_systemd_stop_timeout_allows_bounded_graceful_shutdown() -> None:
     service = (PROJECT_ROOT / "deploy" / "pa2bridge.service").read_text()
 
-    assert "TimeoutStopSec=45s" in service
+    assert "TimeoutStopSec=75s" in service
+    shutdown_timeout = 75
+    shutdown_publish_budget = 2 * SHUTDOWN_PUBLISH_TIMEOUT
+    assert shutdown_timeout > PA2_READ_CYCLE_TIMEOUT + shutdown_publish_budget
+    assert shutdown_timeout > MAX_RECALL_TIMEOUT_SECONDS + shutdown_publish_budget
 
 
 def test_public_install_shape_is_a_supervisor_managed_app_not_hacs() -> None:

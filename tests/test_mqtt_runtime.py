@@ -125,6 +125,10 @@ class FakePa2Client:
         self.connected = True
         self.connection_generation += 1
 
+    def connect_before(self, username, password, *, deadline) -> None:
+        del deadline
+        self.connect(username, password)
+
     def close(self) -> None:
         self.closed += 1
         self.connected = False
@@ -171,24 +175,30 @@ class FakeController:
             },
         )
 
-    def identity(self):
+    def identity(self, *, deadline=None):
+        del deadline
         self.identity_calls += 1
         return self.identity_value
 
-    def list_presets(self):
+    def list_presets(self, *, deadline=None):
+        del deadline
         return self.presets
 
-    def list_all_presets(self):
+    def list_all_presets(self, *, deadline=None):
+        del deadline
         return self.all_presets
 
-    def list_preset_views(self):
+    def list_preset_views(self, *, deadline=None):
+        del deadline
         self.preset_view_calls += 1
         return self.presets, self.all_presets
 
-    def crossover(self):
+    def crossover(self, *, deadline=None):
+        del deadline
         return self.crossover_value
 
-    def state(self, *, identity=None):
+    def state(self, *, identity=None, deadline=None):
+        del deadline
         if self.raise_keyboard_on_state:
             raise KeyboardInterrupt
         self.state_identities.append(identity)
@@ -200,10 +210,12 @@ class FakeController:
             self.state_value.output_mutes,
         )
 
-    def output_levels(self):
+    def output_levels(self, *, deadline=None):
+        del deadline
         return {channel: -42.25 for channel in self.state_value.output_mutes}
 
-    def input_meters(self):
+    def input_meters(self, *, deadline=None):
+        del deadline
         return InputMeters(
             levels_dbfs={"left": -18.45, "right": -19.55},
             clips={"left": False, "right": True},
@@ -412,7 +424,8 @@ def test_initial_pa2_failure_connects_mqtt_and_marks_device_offline(monkeypatch)
     bridge, client, pa2, _ = make_bridge(monkeypatch)
     bridge._mqtt_connected = False
 
-    def unavailable() -> None:
+    def unavailable(*, deadline=None) -> None:
+        del deadline
         raise OSError("PA2 unavailable")
 
     def stop_after_retry_delay(timeout: float | None = None) -> None:
@@ -433,8 +446,8 @@ def test_connect_callback_survives_pa2_failure_and_publishes_offline(monkeypatch
     bridge, client, pa2, controller = make_bridge(monkeypatch)
     bridge._connect_pa2()
 
-    def unavailable(*, identity=None):
-        del identity
+    def unavailable(*, identity=None, deadline=None):
+        del identity, deadline
         raise OSError("PA2 unavailable")
 
     controller.state = unavailable
@@ -913,7 +926,8 @@ def test_failed_detail_refresh_marks_retained_details_unavailable(monkeypatch) -
     bridge, client, _, controller = make_bridge(monkeypatch)
     bridge.publish_details()
 
-    def invalid_crossover():
+    def invalid_crossover(*, deadline=None):
+        del deadline
         raise OSError("crossover unavailable")
 
     controller.crossover = invalid_crossover
@@ -939,12 +953,12 @@ def test_failed_detail_refresh_is_retried_on_next_healthy_poll(monkeypatch) -> N
     real_crossover = controller.crossover
     attempts = 0
 
-    def transient_crossover():
+    def transient_crossover(*, deadline=None):
         nonlocal attempts
         attempts += 1
         if attempts == 1:
             raise OSError("transient crossover failure")
-        return real_crossover()
+        return real_crossover(deadline=deadline)
 
     controller.crossover = transient_crossover
 
@@ -1079,7 +1093,8 @@ def test_detail_refresh_does_not_republish_unchanged_discovery(monkeypatch) -> N
 def test_meter_collection_failure_never_publishes_online(monkeypatch) -> None:
     bridge, client, _, controller = make_bridge(monkeypatch, expose_meters=True)
 
-    def unavailable_levels():
+    def unavailable_levels(*, deadline=None):
+        del deadline
         raise OSError("meter read failed")
 
     controller.output_levels = unavailable_levels
@@ -1159,7 +1174,11 @@ def test_unexpected_post_actuation_failure_closes_pa2_and_publishes_offline(
 
 def test_run_forever_uses_paho_background_loop_for_automatic_broker_reconnect(monkeypatch) -> None:
     bridge, client, pa2, controller = make_bridge(monkeypatch)
-    monkeypatch.setattr(bridge, "_connect_pa2", lambda: setattr(pa2, "connected", True))
+    monkeypatch.setattr(
+        bridge,
+        "_connect_pa2",
+        lambda **_: setattr(pa2, "connected", True),
+    )
     controller.raise_keyboard_on_state = True
 
     bridge.run_forever()
@@ -1175,7 +1194,11 @@ def test_run_forever_uses_paho_background_loop_for_automatic_broker_reconnect(mo
 
 def test_run_forever_releases_pa2_lock_before_stopping_mqtt_loop(monkeypatch) -> None:
     bridge, client, pa2, controller = make_bridge(monkeypatch)
-    monkeypatch.setattr(bridge, "_connect_pa2", lambda: setattr(pa2, "connected", True))
+    monkeypatch.setattr(
+        bridge,
+        "_connect_pa2",
+        lambda **_: setattr(pa2, "connected", True),
+    )
     controller.raise_keyboard_on_state = True
 
     def loop_stop() -> None:
@@ -1200,7 +1223,11 @@ def test_run_forever_releases_pa2_lock_before_stopping_mqtt_loop(monkeypatch) ->
 
 def test_run_forever_installs_and_restores_graceful_sigterm_handler(monkeypatch) -> None:
     bridge, client, pa2, _ = make_bridge(monkeypatch)
-    monkeypatch.setattr(bridge, "_connect_pa2", lambda: setattr(pa2, "connected", True))
+    monkeypatch.setattr(
+        bridge,
+        "_connect_pa2",
+        lambda **_: setattr(pa2, "connected", True),
+    )
     registrations: list[tuple[int, object]] = []
     previous_handler = signal.SIG_DFL
     original_loop_start = client.loop_start
@@ -1231,6 +1258,84 @@ def test_run_forever_installs_and_restores_graceful_sigterm_handler(monkeypatch)
     assert client.loop_stopped == 1
     assert client.disconnected == 1
     assert pa2.closed == 1
+
+
+def test_sigterm_handler_defers_logging_and_event_synchronization(monkeypatch) -> None:
+    bridge, _, _, _ = make_bridge(monkeypatch)
+
+    def forbidden(*args, **kwargs) -> None:
+        del args, kwargs
+        raise AssertionError("signal handler used synchronization")
+
+    monkeypatch.setattr("pa2bridge.mqtt_bridge.LOGGER.info", forbidden)
+    monkeypatch.setattr(bridge._stop_event, "set", forbidden)
+    monkeypatch.setattr(bridge._mqtt_ready, "set", forbidden)
+    monkeypatch.setattr(bridge._mqtt_state_changed, "set", forbidden)
+
+    bridge._handle_sigterm(signal.SIGTERM, None)
+
+    assert bridge._sigterm_requested is True
+
+
+def test_poll_uses_one_absolute_deadline_for_all_pa2_reads(monkeypatch) -> None:
+    bridge, _, pa2, controller = make_bridge(monkeypatch, expose_meters=True)
+    pa2.connected = True
+    bridge._discovery_published = True
+    deadlines: list[float] = []
+
+    def record(result):
+        def operation(*args, deadline, **kwargs):
+            del args, kwargs
+            deadlines.append(deadline)
+            return result
+
+        return operation
+
+    monkeypatch.setattr("pa2bridge.mqtt_bridge.time.monotonic", lambda: 100.0)
+    controller.identity = record(controller.identity_value)
+    controller.state = record(controller.state_value)
+    controller.output_levels = record(
+        {channel: -42.25 for channel in controller.state_value.output_mutes}
+    )
+    controller.input_meters = record(controller.input_meters())
+    controller.list_preset_views = record((controller.presets, controller.all_presets))
+    controller.crossover = record(controller.crossover_value)
+
+    bridge._poll_once()
+
+    assert deadlines
+    assert set(deadlines) == {160.0}
+
+
+def test_sigterm_waits_for_inflight_pa2_mutation_and_skips_followup_reads(
+    monkeypatch,
+) -> None:
+    bridge, _, _, controller = make_bridge(monkeypatch)
+    mutation_finished = False
+
+    def mutate(muted: bool) -> None:
+        nonlocal mutation_finished
+        assert muted is False
+        bridge._handle_sigterm(signal.SIGTERM, None)
+        assert bridge._stop_event.is_set() is False
+        mutation_finished = True
+
+    def forbidden_state(*, identity=None, deadline=None):
+        del identity, deadline
+        raise AssertionError("shutdown performed a follow-up PA2 read")
+
+    monkeypatch.setattr(controller, "set_all_outputs_muted", mutate)
+    monkeypatch.setattr(controller, "state", forbidden_state)
+    bridge._on_message(
+        None,
+        None,
+        message("driverack/pa2/command/unmute", "PRESS"),
+    )
+
+    bridge._process_queued_command()
+
+    assert mutation_finished is True
+    assert bridge._stop_event.is_set()
 
 
 def test_unacknowledged_shutdown_publication_fails_closed(monkeypatch) -> None:
@@ -1303,8 +1408,8 @@ def test_failed_poll_waits_for_command_then_closes_inside_same_transaction(monke
         assert release_command.wait(timeout=2)
         return controller.state_value
 
-    def failed_state(*, identity=None):
-        del identity
+    def failed_state(*, identity=None, deadline=None):
+        del identity, deadline
         raise OSError("poll failed")
 
     controller.activate_preset = blocking_activation
@@ -1346,8 +1451,8 @@ def test_failed_poll_waits_for_command_then_closes_inside_same_transaction(monke
 def test_poll_failure_invalidates_core_and_detail_availability(monkeypatch) -> None:
     bridge, client, _, controller = make_bridge(monkeypatch)
 
-    def unavailable(*, identity=None):
-        del identity
+    def unavailable(*, identity=None, deadline=None):
+        del identity, deadline
         raise OSError("PA2 unavailable")
 
     controller.state = unavailable
@@ -1382,7 +1487,8 @@ def test_preset_command_invalidates_details_before_device_recall(monkeypatch) ->
 def test_command_meter_failure_marks_core_and_details_offline(monkeypatch) -> None:
     bridge, client, _, controller = make_bridge(monkeypatch, expose_meters=True)
 
-    def invalid_meters():
+    def invalid_meters(*, deadline=None):
+        del deadline
         raise TelemetryError("non-finite output meter")
 
     controller.output_levels = invalid_meters
