@@ -395,6 +395,22 @@ def test_mac_identity_and_discovery_topics_stay_stable_when_host_changes(monkeyp
     ]
 
 
+def _write_on_link_route(
+    tmp_path: Path,
+    interfaces: tuple[str, ...] = ("eth0",),
+) -> Path:
+    route_path = tmp_path / "route"
+    route_path.write_text(
+        "Iface Destination Gateway Flags RefCnt Use Metric Mask MTU Window IRTT\n"
+        + "".join(
+            f"{interface} 000200C0 00000000 0001 0 0 0 00FFFFFF 0 0 0\n"
+            for interface in interfaces
+        ),
+        encoding="ascii",
+    )
+    return route_path
+
+
 def test_discovers_complete_unicast_mac_for_configured_ipv4_address(tmp_path: Path) -> None:
     arp_path = tmp_path / "arp"
     arp_path.write_text(
@@ -404,9 +420,11 @@ def test_discovers_complete_unicast_mac_for_configured_ipv4_address(tmp_path: Pa
         encoding="ascii",
     )
 
-    assert _discover_mac_address("192.0.2.20", arp_path=arp_path) == (
-        "02:00:5e:10:00:01"
-    )
+    assert _discover_mac_address(
+        "192.0.2.20",
+        arp_path=arp_path,
+        route_path=_write_on_link_route(tmp_path),
+    ) == "02:00:5e:10:00:01"
 
 
 @pytest.mark.parametrize(
@@ -427,7 +445,11 @@ def test_neighbor_discovery_rejects_unsupported_hardware_and_flags(
         encoding="ascii",
     )
 
-    assert _discover_mac_address("192.0.2.20", arp_path=arp_path) is None
+    assert _discover_mac_address(
+        "192.0.2.20",
+        arp_path=arp_path,
+        route_path=_write_on_link_route(tmp_path),
+    ) is None
 
 
 def test_neighbor_discovery_rejects_conflicting_entries(tmp_path: Path) -> None:
@@ -435,19 +457,109 @@ def test_neighbor_discovery_rejects_conflicting_entries(tmp_path: Path) -> None:
     arp_path.write_text(
         "IP address HW type Flags HW address Mask Device\n"
         "192.0.2.20 0x1 0x2 02:00:5e:10:00:01 * eth0\n"
-        "192.0.2.20 0x1 0x2 02:00:5e:10:00:02 * eth1\n",
+        "192.0.2.20 0x1 0x2 02:00:5e:10:00:02 * eth0\n",
         encoding="ascii",
     )
 
     with pytest.raises(DiscoveryStateError, match="conflicting PA2 MAC"):
-        _discover_mac_address("192.0.2.20", arp_path=arp_path)
+        _discover_mac_address(
+            "192.0.2.20",
+            arp_path=arp_path,
+            route_path=_write_on_link_route(tmp_path),
+        )
 
 
 def test_neighbor_discovery_rejects_oversized_table(tmp_path: Path) -> None:
     arp_path = tmp_path / "arp"
     arp_path.write_bytes(b"x" * (64 * 1024 + 1))
 
-    assert _discover_mac_address("192.0.2.20", arp_path=arp_path) is None
+    assert _discover_mac_address(
+        "192.0.2.20",
+        arp_path=arp_path,
+        route_path=_write_on_link_route(tmp_path),
+    ) is None
+
+
+def test_neighbor_discovery_rejects_proxy_arp_for_routed_peer(tmp_path: Path) -> None:
+    arp_path = tmp_path / "arp"
+    arp_path.write_text(
+        "IP address HW type Flags HW address Mask Device\n"
+        "192.0.2.20 0x1 0x2 02:00:5e:10:00:01 * eth0\n",
+        encoding="ascii",
+    )
+    route_path = tmp_path / "route"
+    route_path.write_text(
+        "Iface Destination Gateway Flags RefCnt Use Metric Mask MTU Window IRTT\n"
+        "eth0 00000000 010200C0 0003 0 0 0 00000000 0 0 0\n",
+        encoding="ascii",
+    )
+
+    assert _discover_mac_address(
+        "192.0.2.20",
+        arp_path=arp_path,
+        route_path=route_path,
+    ) is None
+
+
+@pytest.mark.parametrize(
+    "route_rows",
+    [
+        (
+            "eth0 000200C0 00000000 0001 0 0 0 00FFFFFF 0 0 0\n"
+            "eth0 140200C0 invalid 0007 0 0 0 FFFFFFFF 0 0 0\n"
+        ),
+        "eth0 140200C0 00000000 0205 0 0 0 FFFFFFFF 0 0 0\n",
+        (
+            "eth0 000200C0 00000000 0001 0 0 0 00FFFFFF 0 0 0\n"
+            "eth1 000200C0 00000000 0001 0 0 0 00FFFFFF 0 0 0\n"
+        ),
+    ],
+)
+def test_neighbor_discovery_fails_closed_on_unsafe_route_tables(
+    tmp_path: Path,
+    route_rows: str,
+) -> None:
+    arp_path = tmp_path / "arp"
+    arp_path.write_text(
+        "IP address HW type Flags HW address Mask Device\n"
+        "192.0.2.20 0x1 0x2 02:00:5e:10:00:01 * eth0\n",
+        encoding="ascii",
+    )
+    route_path = tmp_path / "route"
+    route_path.write_text(
+        "Iface Destination Gateway Flags RefCnt Use Metric Mask MTU Window IRTT\n"
+        + route_rows,
+        encoding="ascii",
+    )
+
+    assert _discover_mac_address(
+        "192.0.2.20",
+        arp_path=arp_path,
+        route_path=route_path,
+    ) is None
+
+
+def test_neighbor_discovery_uses_lowest_metric_on_link_route(tmp_path: Path) -> None:
+    arp_path = tmp_path / "arp"
+    arp_path.write_text(
+        "IP address HW type Flags HW address Mask Device\n"
+        "192.0.2.20 0x1 0x2 02:00:5e:10:00:01 * eth0\n"
+        "192.0.2.20 0x1 0x2 02:00:5e:10:00:02 * eth1\n",
+        encoding="ascii",
+    )
+    route_path = tmp_path / "route"
+    route_path.write_text(
+        "Iface Destination Gateway Flags RefCnt Use Metric Mask MTU Window IRTT\n"
+        "eth0 000200C0 00000000 0001 0 0 5 00FFFFFF 0 0 0\n"
+        "eth1 000200C0 00000000 0001 0 0 10 00FFFFFF 0 0 0\n",
+        encoding="ascii",
+    )
+
+    assert _discover_mac_address(
+        "192.0.2.20",
+        arp_path=arp_path,
+        route_path=route_path,
+    ) == "02:00:5e:10:00:01"
 
 
 def test_hostname_with_multiple_ipv4_addresses_is_not_auto_correlated(

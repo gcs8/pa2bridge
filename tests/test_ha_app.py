@@ -455,7 +455,7 @@ def test_home_assistant_app_metadata_is_bounded_and_requires_mqtt() -> None:
     assert 'breaking_versions:\n  - "0.1.2"' in config
     assert '- "int(1,2)"' not in config
     assert 'pa2_password: "password?"' not in config
-    assert "host_network: true" in config
+    assert "host_network:" not in config
     assert "hassio_api: true" not in config
     assert "homeassistant_api: true" in config
     assert "privileged:" not in config

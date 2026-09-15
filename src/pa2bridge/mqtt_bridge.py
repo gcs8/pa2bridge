@@ -56,6 +56,7 @@ _MAX_DISCOVERY_STATE_BYTES = 64 * 1024
 _MAX_DISCOVERY_TOPICS = 100
 _MAX_IDENTITY_STATE_BYTES = 1024
 _MAX_ARP_TABLE_BYTES = 64 * 1024
+_MAX_ROUTE_TABLE_BYTES = 64 * 1024
 _MAX_HA_STATES_BYTES = 16 * 1024 * 1024
 _MAX_HA_TEMPLATE_BYTES = 64 * 1024
 _MAX_HA_CONFIG_ENTRIES_BYTES = 2 * 1024 * 1024
@@ -102,15 +103,92 @@ def _resolve_ipv4_addresses(host: str) -> set[str]:
             return set()
 
 
+def _proc_ipv4(value: str) -> int:
+    if len(value) != 8:
+        raise ValueError("invalid proc IPv4 field")
+    return int.from_bytes(bytes.fromhex(value), "little")
+
+
+def _on_link_interfaces(
+    address: str,
+    *,
+    route_path: Path,
+) -> set[str]:
+    """Return interfaces whose most-specific route reaches the peer directly."""
+
+    try:
+        target = int(ipaddress.IPv4Address(address))
+        with route_path.open("rb") as handle:
+            raw = handle.read(_MAX_ROUTE_TABLE_BYTES + 1)
+    except (OSError, ValueError):
+        return set()
+    if len(raw) > _MAX_ROUTE_TABLE_BYTES:
+        return set()
+    try:
+        lines = raw.decode("ascii").splitlines()[1:]
+    except UnicodeDecodeError:
+        return set()
+    routes: list[tuple[int, int, bool, str]] = []
+    for line in lines:
+        if not line.strip():
+            continue
+        fields = line.split()
+        if len(fields) < 8:
+            return set()
+        try:
+            destination = _proc_ipv4(fields[1])
+            gateway = _proc_ipv4(fields[2])
+            flags = int(fields[3], 16)
+            metric = int(fields[6], 10)
+            mask = _proc_ipv4(fields[7])
+        except ValueError:
+            return set()
+        inverse_mask = (~mask) & 0xFFFFFFFF
+        if (
+            inverse_mask & (inverse_mask + 1)
+            or destination & inverse_mask
+            or flags < 0
+            or metric < 0
+        ):
+            return set()
+        if not flags & 0x1 or target & mask != destination & mask:
+            continue
+        routes.append(
+            (
+                mask.bit_count(),
+                metric,
+                gateway == 0 and not flags & (0x2 | 0x0200),
+                fields[0],
+            )
+        )
+    if not routes:
+        return set()
+    longest_prefix = max(prefix for prefix, _, _, _ in routes)
+    longest = [route for route in routes if route[0] == longest_prefix]
+    lowest_metric = min(metric for _, metric, _, _ in longest)
+    best = [route for route in longest if route[1] == lowest_metric]
+    if any(not on_link for _, _, on_link, _ in best):
+        return set()
+    interfaces = {interface for _, _, _, interface in best}
+    return interfaces if len(interfaces) == 1 else set()
+
+
 def _discover_mac_address(
     host: str,
     *,
     arp_path: Path = Path("/proc/net/arp"),
+    route_path: Path = Path("/proc/net/route"),
 ) -> str | None:
-    """Read the connected IPv4 peer's complete entry from the local ARP table."""
+    """Read an on-link IPv4 peer's complete entry from the local ARP table."""
 
     addresses = _resolve_ipv4_addresses(host)
     if not addresses:
+        return None
+    on_link_interfaces = _on_link_interfaces(
+        next(iter(addresses)),
+        route_path=route_path,
+    )
+    if not on_link_interfaces:
         return None
     try:
         with arp_path.open("rb") as handle:
@@ -126,7 +204,11 @@ def _discover_mac_address(
     matches: set[str] = set()
     for line in lines:
         fields = line.split()
-        if len(fields) < 6 or fields[0] not in addresses:
+        if (
+            len(fields) < 6
+            or fields[0] not in addresses
+            or fields[5] not in on_link_interfaces
+        ):
             continue
         try:
             flags = int(fields[2], 16)

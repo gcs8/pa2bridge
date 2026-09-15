@@ -7,7 +7,6 @@ arch:
   - amd64
   - aarch64
 init: false
-host_network: true
 homeassistant_api: true
 stage: experimental
 timeout: 75
