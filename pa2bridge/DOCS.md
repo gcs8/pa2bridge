@@ -21,7 +21,7 @@ Preset recall starts one finite absolute deadline at public entry, validates the
 ## Options
 
 - `pa2_host`: DriveRack PA2 IPv4 address or resolvable hostname.
-- `pa2_mac_address`: optional override for the automatically discovered MAC. Colons and hyphens are accepted and normalized to lowercase colon form. Address-based identity is used only on a first run where no configured, discovered, or saved MAC exists.
+- `pa2_mac_address`: optional override for the automatically discovered MAC. Colons and hyphens are accepted and normalized to lowercase colon form. Address-based identity is used only for the first physical connection when no configured, discovered, or saved MAC exists; after that socket closes, the App stays offline until it can validate a MAC.
 - `pa2_port`: PA2 Console TCP port; normally `19272`.
 - `pa2_username` and `pa2_password_override`: PA2 Console credentials. A blank password override uses the factory default, `administrator`.
 - `preset_slots`: `auto` publishes every named preset reported by the device. A comma-separated set of unique slots from `1` through `100` narrows recall to those slots.

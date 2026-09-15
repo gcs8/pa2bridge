@@ -1050,6 +1050,7 @@ class MqttBridge:
         self._persisted_identity = _load_identity_state(self.identity_state_path)
         self._pending_identity_state: tuple[str, str] | None = None
         self._stable_mac_address = config.pa2.mac_address
+        self._address_only_connection_generation: int | None = None
         self.pa2_client = HiQnetClient(
             config.pa2.host,
             port=config.pa2.port,
@@ -1479,6 +1480,10 @@ class MqttBridge:
                 self.config.pa2.password,
                 deadline=deadline,
             )
+            validated_peer = self._device_info(
+                DeviceIdentity("dbxDriveRackPA2", "DriveRackPA2", "unknown"),
+                deadline=deadline,
+            )
             identity = self.controller.identity(deadline=deadline)
             self._pa2_identity = (
                 self.pa2_client.connection_generation,
@@ -1487,7 +1492,12 @@ class MqttBridge:
             presets = self.controller.list_presets(deadline=deadline)
             self._allowed_presets = tuple(presets)
             self._preset_commands = frozenset(preset.label for preset in presets)
-            self.device = self._device_info(identity, deadline=deadline)
+            self.device = DeviceInfo(
+                identifier=validated_peer.identifier,
+                name=identity.instance_name,
+                firmware=identity.firmware,
+                mac_address=validated_peer.mac_address,
+            )
             self.discovery = build_discovery_messages(
                 device=self.device,
                 presets=presets,
@@ -1589,14 +1599,25 @@ class MqttBridge:
                 "the connected PA2 peer MAC could not be revalidated"
             )
         else:
+            current_generation = self.pa2_client.connection_generation
+            if (
+                self._address_only_connection_generation is not None
+                and self._address_only_connection_generation != current_generation
+            ):
+                raise IdentityRevalidationUnavailable(
+                    "the connected PA2 peer MAC could not be revalidated"
+                )
             mac_address = None
+            self._address_only_connection_generation = current_generation
             LOGGER.warning(
                 "PA2 MAC was not found for %s; using address-based MQTT identity. "
-                "Commands that require an internal reconnect will be refused until a "
-                "stable MAC is available; check UniFi tracking or enter the optional "
-                "PA2 MAC address.",
+                "Any later physical connection will be refused until a stable MAC is "
+                "available; check UniFi tracking or enter the optional PA2 MAC address.",
                 self.config.pa2.host,
             )
+
+        if mac_address is not None:
+            self._address_only_connection_generation = None
 
         if mac_address is not None and self.identity_state_path is not None:
             persisted_host = peer_ipv4 or self.config.pa2.host

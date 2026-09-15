@@ -690,6 +690,49 @@ def test_address_fallback_never_authorizes_reconnect(monkeypatch) -> None:
         bridge._validate_reconnected_peer(time.monotonic() + 5)
 
 
+def test_address_fallback_rejects_later_bridge_connection_before_pa2_operations(
+    monkeypatch,
+) -> None:
+    bridge, _, pa2, controller = make_bridge(monkeypatch)
+    bridge._connect_pa2()
+    pa2.close()
+    operations: list[tuple[int, str]] = []
+
+    def unexpected_operation(name: str):
+        def operation(*args, **kwargs):
+            del args, kwargs
+            operations.append((pa2.connection_generation, name))
+            raise AssertionError(
+                f"replacement PA2 {name} ran before identity validation"
+            )
+
+        return operation
+
+    for name in (
+        "identity",
+        "list_presets",
+        "list_all_presets",
+        "list_preset_views",
+        "crossover",
+        "state",
+        "output_levels",
+        "input_meters",
+        "activate_preset",
+        "set_all_outputs_muted",
+        "set_output_muted",
+    ):
+        monkeypatch.setattr(controller, name, unexpected_operation(name))
+
+    with pytest.raises(
+        IdentityRevalidationUnavailable,
+        match="could not be revalidated",
+    ):
+        bridge._connect_pa2()
+
+    assert pa2.connection_generation == 2
+    assert operations == []
+
+
 def test_automatic_mac_identity_survives_address_change_when_revalidated(
     monkeypatch,
     tmp_path: Path,
@@ -2254,7 +2297,10 @@ def test_discovery_ack_after_aggregate_deadline_is_rejected(monkeypatch) -> None
 
 
 def test_poll_reuses_identity_until_the_pa2_connection_generation_changes(monkeypatch) -> None:
-    bridge, _, pa2, controller = make_bridge(monkeypatch)
+    bridge, _, pa2, controller = make_bridge(
+        monkeypatch,
+        pa2_mac_address="02:00:5e:10:00:01",
+    )
     bridge._connect_pa2()
     bridge._discovery_published = True
     bridge._details_valid = True
@@ -2275,7 +2321,10 @@ def test_poll_reuses_identity_until_the_pa2_connection_generation_changes(monkey
 
 
 def test_poll_refreshes_identity_before_republishing_discovery(monkeypatch) -> None:
-    bridge, client, pa2, controller = make_bridge(monkeypatch)
+    bridge, client, pa2, controller = make_bridge(
+        monkeypatch,
+        pa2_mac_address="02:00:5e:10:00:01",
+    )
     bridge._connect_pa2()
     bridge._discovery_published = False
     bridge._details_valid = True
@@ -2329,7 +2378,10 @@ def test_mute_commands_reuse_identity_from_the_current_connection(monkeypatch) -
 
 
 def test_recall_reconnect_refreshes_identity_before_publishing_state(monkeypatch) -> None:
-    bridge, client, pa2, controller = make_bridge(monkeypatch)
+    bridge, client, pa2, controller = make_bridge(
+        monkeypatch,
+        pa2_mac_address="02:00:5e:10:00:01",
+    )
     bridge._connect_pa2()
     bridge._discovery_published = True
 
@@ -2896,7 +2948,10 @@ def test_post_command_reads_use_full_read_cycle_deadline(
     payload: str,
     operation: str,
 ) -> None:
-    bridge, _, pa2, controller = make_bridge(monkeypatch)
+    bridge, _, pa2, controller = make_bridge(
+        monkeypatch,
+        pa2_mac_address="02:00:5e:10:00:01",
+    )
     identity_deadlines: list[float] = []
     state_deadlines: list[float] = []
     publish_deadlines: list[float] = []
@@ -3624,7 +3679,10 @@ def test_unacknowledged_shutdown_publication_fails_closed(monkeypatch) -> None:
 
 
 def test_pa2_connect_waits_for_inflight_command_transaction(monkeypatch) -> None:
-    bridge, _, pa2, controller = make_bridge(monkeypatch)
+    bridge, _, pa2, controller = make_bridge(
+        monkeypatch,
+        pa2_mac_address="02:00:5e:10:00:01",
+    )
     command_entered = threading.Event()
     release_command = threading.Event()
     connect_started = threading.Event()
