@@ -974,18 +974,12 @@ class MqttBridge:
                         self._publish(
                             f"{base}/status/details", "offline", retain=True
                         )
-                        identity = self._identity_for_connection()
+                        identity = self._identity_for_connection(
+                            deadline=self._command_deadline(command)
+                        )
                         if self._apply_pending_sigterm():
                             return
                         device_touched = True
-                        cached_identity = self._pa2_identity
-                        identity = (
-                            cached_identity[1]
-                            if cached_identity is not None
-                            and cached_identity[0]
-                            == self.pa2_client.connection_generation
-                            else None
-                        )
                         state = self.controller.activate_preset(
                             command.payload,
                             unmute_after=True,

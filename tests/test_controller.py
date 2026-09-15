@@ -1080,6 +1080,42 @@ def test_activation_checks_command_deadline_at_preflight_and_first_write() -> No
     assert {deadline for _, deadline in client.deadlines[first_set + 1 :]} <= {1.0}
 
 
+def test_already_active_preset_reads_use_command_start_deadline() -> None:
+    class DeadlineAwareClient(FakeClient):
+        def __init__(self) -> None:
+            super().__init__(current=1)
+            self.deadlines: list[float] = []
+
+        def get_before(self, path: Iterable[str], *, deadline: float) -> str:
+            self.deadlines.append(deadline)
+            return self.get(path)
+
+        def ls_before(
+            self,
+            path: Iterable[str],
+            *,
+            deadline: float,
+        ) -> dict[str, str]:
+            self.deadlines.append(deadline)
+            return self.ls(path)
+
+    client = DeadlineAwareClient()
+    controller = Pa2Controller(
+        client,
+        allowed_slots=(1, 2),
+        recall_timeout=1.0,
+        post_recall_delay=0.0,
+        monotonic=lambda: 0.0,
+    )
+
+    state = controller.activate_preset(1, start_deadline=0.5)
+
+    assert state.current_preset.slot == 1
+    assert client.sets == []
+    assert client.deadlines
+    assert set(client.deadlines) == {0.5}
+
+
 @pytest.mark.parametrize("operation", ["preset", "all", "single"])
 def test_expired_command_before_first_write_does_not_trigger_rollback(
     operation: str,
