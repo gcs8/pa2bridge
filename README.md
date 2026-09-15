@@ -78,11 +78,12 @@ The app package lives in [`pa2bridge/`](pa2bridge/). After a reviewed release im
 1. In Home Assistant, open **Settings → Apps → App store → Repositories**.
 2. Add `https://github.com/gcs8/pa2bridge`.
 3. Install **PA2Bridge** and enter the PA2 host. Leave `pa2_password_override` blank to use the factory-default administrator password, and leave `preset_slots` set to `auto` to publish every preset reported by the PA2.
-4. Confirm every other PA2 writer is stopped before starting the app.
+4. Leave the MAC field blank. PA2Bridge normally discovers it after connecting. Enter a MAC only when automatic discovery is unavailable.
+5. Confirm every other PA2 writer is stopped before starting the app.
 
-The app requests Home Assistant's `mqtt:need` service and receives dedicated broker credentials from Supervisor. PA2 and MQTT secrets are not placed in Git or Stream Deck profiles.
+The app requests Home Assistant's `mqtt:need` service and receives dedicated broker credentials from Supervisor. It also has Home Assistant Core API access for read-only IP-to-MAC correlation. PA2 and MQTT secrets are not placed in Git or Stream Deck profiles.
 
-The app keeps its MQTT discovery-topic manifest in `/data/discovery.json`. On startup or an identity/configuration change, it clears retained topics no longer owned by the current PA2 device before publishing the current discovery records. Do not remove this file independently of broker cleanup; malformed state stops startup rather than risking deletion of an unverified topic.
+The app keeps its MQTT discovery-topic manifest in `/data/discovery.json` and its validated address-to-MAC binding in `/data/identity.json`. On startup or an identity/configuration change, it clears retained topics no longer owned by the current PA2 device before publishing the current discovery records. Do not remove these files independently of broker cleanup; malformed state stops startup rather than risking an unsafe identity change or deletion of an unverified topic.
 
 Upgrading from v0.1.1 requires a manual update because the configuration fields changed. Factory-password users can leave `pa2_password_override` blank. Users with a custom PA2 password must re-enter it in that field before starting v0.1.2 or newer. A retained restrictive legacy `allowed_preset_slots` list remains the active narrower restriction while `preset_slots` is `auto`. If both fields contain explicit lists, PA2Bridge accepts equivalent slot sets regardless of order and rejects differing restrictions instead of widening recall scope.
 
@@ -206,6 +207,12 @@ MQTT discovery creates one HA device named from the PA2's observed `Instance_Nam
 The PA2 front-panel **System Lockout** state is not exposed because neither the inspected PA2UI revision nor the verified PA2 object tree provided an identified lockout value. The observed `Access_Rights` field is intentionally not relabeled as System Lockout without protocol evidence.
 
 Entity IDs are assigned by Home Assistant and can be renamed in the entity registry. Use the actual IDs shown on the PA2 device page rather than assuming an ID.
+
+After authenticating to the configured PA2 address, PA2Bridge binds discovery to the TCP socket's actual IPv4 peer and first checks that peer in the local neighbour table. If the PA2 is across a router, the App instead checks authorized connection trackers reported within the previous two hours and requires one unambiguous peer-address-to-MAC match. It verifies through Home Assistant's registry that each accepted tracker belongs to UniFi or UniFi Insights. A MAC is not carried through a Layer 3 connection itself; the network integration supplies that control-plane mapping.
+
+The first validated automatic match is saved in `/data/identity.json`. Without a manual override, every later PA2 connection must revalidate the actual peer and agree with that identity. A temporary lookup failure stops the connection rather than replacing a MAC identity with an address identity. When the configured address changes, the MAC at the new peer must match the saved identity. A conflicting manual override also stops startup; replacing the physical PA2 requires deliberate identity and retained-discovery cleanup. Current Home Assistant releases may still show a separate UniFi device with the same MAC—the shared MAC helps correlate them but does not guarantee a cross-integration merge. Use `pa2_mac_address` when automatic correlation is unavailable. Address-based identity remains a first-run fallback only when no validated or configured MAC exists.
+
+To replace the physical PA2, enter the new unit's MAC and turn on **Replace saved PA2 identity**. Start the app and wait for it to report that discovery was published. PA2Bridge then removes the discovery topics it previously owned and publishes the new identity. Turn the replacement option off afterward. A live MAC that disagrees with the entered value still stops startup.
 
 ## Stream Deck
 

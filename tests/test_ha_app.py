@@ -24,12 +24,15 @@ MQTT_ENV = {
     "PA2BRIDGE_MQTT_PORT": "1883",
     "PA2BRIDGE_MQTT_USERNAME": "app-user",
     "PA2BRIDGE_MQTT_PASSWORD": "mqtt-secret",
+    "SUPERVISOR_TOKEN": "synthetic-supervisor-token",
 }
 
 
 def _options(**overrides: object) -> dict[str, object]:
     options: dict[str, object] = {
         "pa2_host": "192.0.2.20",
+        "pa2_mac_address": "",
+        "replace_saved_identity": False,
         "pa2_port": 19272,
         "pa2_username": "administrator",
         "pa2_password_override": "pa2-secret",
@@ -86,12 +89,18 @@ def test_main_uses_durable_app_discovery_state(monkeypatch, tmp_path: Path) -> N
     _write_options(path, _options())
     for key, value in MQTT_ENV.items():
         monkeypatch.setenv(key, value)
-    calls: list[Path] = []
+    calls: list[tuple[Path, str | None]] = []
 
     class FakeBridge:
-        def __init__(self, config, *, discovery_state_path: Path) -> None:
+        def __init__(
+            self,
+            config,
+            *,
+            discovery_state_path: Path,
+            home_assistant_token: str | None,
+        ) -> None:
             del config
-            calls.append(discovery_state_path)
+            calls.append((discovery_state_path, home_assistant_token))
 
         def run_forever(self) -> None:
             pass
@@ -99,7 +108,33 @@ def test_main_uses_durable_app_discovery_state(monkeypatch, tmp_path: Path) -> N
     monkeypatch.setattr(ha_app, "MqttBridge", FakeBridge)
 
     assert ha_app.main(["--options", str(path)]) == 0
-    assert calls == [Path("/data/discovery.json")]
+    assert calls == [(Path("/data/discovery.json"), "synthetic-supervisor-token")]
+
+
+@pytest.mark.parametrize(
+    "token",
+    ["", "x" * 8193, "bad\nvalue", "bad\rvalue"],
+)
+def test_main_rejects_invalid_supervisor_token_without_echoing_it(
+    monkeypatch,
+    tmp_path: Path,
+    caplog,
+    token: str,
+) -> None:
+    path = tmp_path / "options.json"
+    _write_options(path, _options())
+    for key, value in MQTT_ENV.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("SUPERVISOR_TOKEN", token)
+
+    assert ha_app.main(["--options", str(path)]) == 2
+    if token:
+        assert token not in caplog.text
+
+
+def test_supervisor_token_rejects_embedded_null() -> None:
+    with pytest.raises(ConfigError, match="Supervisor token is invalid"):
+        ha_app._supervisor_token({"SUPERVISOR_TOKEN": "bad\x00value"})
 
 
 def test_main_reports_mqtt_publish_error_without_traceback(
@@ -113,8 +148,14 @@ def test_main_reports_mqtt_publish_error_without_traceback(
         monkeypatch.setenv(key, value)
 
     class FailedBridge:
-        def __init__(self, config, *, discovery_state_path: Path) -> None:
-            del config, discovery_state_path
+        def __init__(
+            self,
+            config,
+            *,
+            discovery_state_path: Path,
+            home_assistant_token: str | None,
+        ) -> None:
+            del config, discovery_state_path, home_assistant_token
 
         def run_forever(self) -> None:
             raise ha_app.MqttPublishError("broker rejected discovery")
@@ -137,6 +178,7 @@ def test_load_ha_app_config_uses_supervisor_options_and_mqtt_service(tmp_path: P
     config = load_ha_app_config(path, environ=MQTT_ENV)
 
     assert config.pa2.host == "192.0.2.20"
+    assert config.pa2.mac_address is None
     assert config.pa2.allowed_preset_slots == (1, 2)
     assert config.pa2.password == "pa2-secret"
     assert config.mqtt.host == "core-mosquitto"
@@ -145,6 +187,46 @@ def test_load_ha_app_config_uses_supervisor_options_and_mqtt_service(tmp_path: P
     assert config.mqtt.password == "mqtt-secret"
     assert "pa2-secret" not in repr(config)
     assert "mqtt-secret" not in repr(config)
+
+
+def test_load_ha_app_config_normalizes_pa2_mac_address(tmp_path: Path) -> None:
+    path = tmp_path / "options.json"
+    _write_options(path, _options(pa2_mac_address="02-00-5E-10-00-01"))
+
+    config = load_ha_app_config(path, environ=MQTT_ENV)
+
+    assert config.pa2.mac_address == "02:00:5e:10:00:01"
+
+
+def test_load_ha_app_config_rejects_invalid_pa2_mac_address(tmp_path: Path) -> None:
+    path = tmp_path / "options.json"
+    _write_options(path, _options(pa2_mac_address="not-a-mac"))
+
+    with pytest.raises(ConfigError, match="MAC address"):
+        load_ha_app_config(path, environ=MQTT_ENV)
+
+
+def test_replace_saved_identity_requires_explicit_mac(tmp_path: Path) -> None:
+    path = tmp_path / "options.json"
+    _write_options(path, _options(replace_saved_identity=True))
+
+    with pytest.raises(ConfigError, match="requires pa2_mac_address"):
+        load_ha_app_config(path, environ=MQTT_ENV)
+
+
+def test_replace_saved_identity_with_mac_is_accepted(tmp_path: Path) -> None:
+    path = tmp_path / "options.json"
+    _write_options(
+        path,
+        _options(
+            pa2_mac_address="02:00:5e:10:00:01",
+            replace_saved_identity=True,
+        ),
+    )
+
+    config = load_ha_app_config(path, environ=MQTT_ENV)
+
+    assert config.pa2.replace_saved_identity is True
 
 
 @pytest.mark.parametrize("password", [None, ""])
@@ -178,6 +260,8 @@ def test_load_ha_app_config_accepts_comma_separated_preset_allowlist(
 def test_load_ha_app_config_accepts_v011_legacy_options(tmp_path: Path) -> None:
     path = tmp_path / "options.json"
     options = _options()
+    options.pop("pa2_mac_address")
+    options.pop("replace_saved_identity")
     options.pop("pa2_password_override")
     options.pop("preset_slots")
     options["pa2_password"] = "legacy-pa2-secret"
@@ -365,13 +449,15 @@ def test_home_assistant_app_metadata_is_bounded_and_requires_mqtt() -> None:
     assert "preset_slots: str" in config
     assert 'pa2_password_override: ""' in config
     assert 'pa2_password_override: password' in config
+    assert 'pa2_mac_address: ""' in config
+    assert "pa2_mac_address: str" in config
     assert 'allowed_preset_slots:\n    - "int(1,100)?"' in config
     assert 'breaking_versions:\n  - "0.1.2"' in config
     assert '- "int(1,2)"' not in config
     assert 'pa2_password: "password?"' not in config
-    assert "host_network: true" not in config
+    assert "host_network: true" in config
     assert "hassio_api: true" not in config
-    assert "homeassistant_api: true" not in config
+    assert "homeassistant_api: true" in config
     assert "privileged:" not in config
     assert 'recall_timeout: "float(0.1,20)"' in config
 

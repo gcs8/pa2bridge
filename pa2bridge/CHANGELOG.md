@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.9
+
+- Discover the PA2 MAC from the authenticated TCP peer through the local neighbour table or bounded Home Assistant network-tracker data, persist the validated binding, and retry safely when current network data is temporarily unavailable. Conflicting identities fail closed. The App includes an explicit replacement workflow and healthy startup logs for MQTT, PA2 identity, preset count, and discovery publication.
+
 ## 0.1.8
 
 - Reject invalid PA2 usernames and passwords during configuration loading, and report Home Assistant App configuration failures as concise structured errors without tracebacks or credential values.

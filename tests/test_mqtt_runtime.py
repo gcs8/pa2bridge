@@ -3,9 +3,11 @@ from __future__ import annotations
 import json
 import os
 import signal
+import socket
 import stat
 import threading
 import time
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -14,6 +16,7 @@ import pytest
 
 from pa2bridge.config import AppConfig, MqttConfig, Pa2Config
 from pa2bridge.controller import (
+    ConnectionValidationError,
     CrossoverBand,
     CrossoverState,
     DeviceIdentity,
@@ -24,15 +27,24 @@ from pa2bridge.controller import (
 )
 from pa2bridge.mqtt_bridge import (
     DiscoveryStateError,
+    IdentityRevalidationUnavailable,
     MqttBridge,
     MqttPublishError,
+    _discover_mac_address,
+    _discover_mac_address_from_home_assistant,
     _fsync_directory,
     _load_discovery_topics,
+    _load_identity_state,
     _marker_payload,
+    _resolve_ipv4_addresses,
     _save_discovery_topics,
     _state_directory_inner_marker,
     _state_directory_marker,
+    _trusted_home_assistant_trackers,
 )
+
+TRACKER_TIMESTAMP = datetime.now(UTC).isoformat()
+STALE_TRACKER_TIMESTAMP = (datetime.now(UTC) - timedelta(hours=3)).isoformat()
 
 
 class FakeMqttClient:
@@ -131,6 +143,7 @@ class FakePa2Client:
     def __init__(self) -> None:
         self.connected = False
         self.connection_generation = 0
+        self.peer_ipv4: str | None = None
         self.connect_args = None
         self.closed = 0
 
@@ -257,10 +270,18 @@ class FakeController:
         self.channel_mutes.append((channel, muted))
 
 
-def make_config(*, expose_meters=False, pa2_host="192.0.2.20"):
+def make_config(
+    *,
+    expose_meters=False,
+    pa2_host="192.0.2.20",
+    pa2_mac_address=None,
+    replace_saved_identity=False,
+):
     return AppConfig(
         pa2=Pa2Config(
             host=pa2_host,
+            mac_address=pa2_mac_address,
+            replace_saved_identity=replace_saved_identity,
             password="pa2-secret",
             allowed_preset_slots=(1, 2),
         ),
@@ -278,18 +299,33 @@ def make_bridge(
     *,
     expose_meters=False,
     pa2_host="192.0.2.20",
+    pa2_mac_address=None,
+    replace_saved_identity=False,
+    home_assistant_token=None,
     discovery_state_path: Path | None = None,
 ):
+    monkeypatch.setattr("pa2bridge.mqtt_bridge._discover_mac_address", lambda host: None)
+    monkeypatch.setattr(
+        "pa2bridge.mqtt_bridge._discover_mac_address_from_home_assistant",
+        lambda host, token, *, timeout=3.0, deadline=None: None,
+    )
     fake_mqtt = FakeMqttClient()
     monkeypatch.setattr(
         "pa2bridge.mqtt_bridge.mqtt.Client",
         lambda *args, **kwargs: fake_mqtt,
     )
     bridge = MqttBridge(
-        make_config(expose_meters=expose_meters, pa2_host=pa2_host),
+        make_config(
+            expose_meters=expose_meters,
+            pa2_host=pa2_host,
+            pa2_mac_address=pa2_mac_address,
+            replace_saved_identity=replace_saved_identity,
+        ),
         discovery_state_path=discovery_state_path,
+        home_assistant_token=home_assistant_token,
     )
     fake_pa2 = FakePa2Client()
+    fake_pa2.peer_ipv4 = pa2_host
     controller = FakeController()
     bridge.pa2_client = fake_pa2
     bridge.controller = controller
@@ -328,6 +364,992 @@ def test_connect_builds_discovery_and_on_connect_publishes_and_subscribes(monkey
     assert crossover["summary"] == "1 band + mono sub"
     assert crossover["bands"][0]["high_pass_hz"] is None
     assert ("driverack/pa2/status/details", "online", 1, True) in client.published
+
+
+def test_mac_identity_and_discovery_topics_stay_stable_when_host_changes(monkeypatch) -> None:
+    mac_address = "02:00:5e:10:00:01"
+    discovered_hosts: list[str] = []
+    first, _, _, _ = make_bridge(
+        monkeypatch,
+        pa2_host="192.0.2.10",
+    )
+    second, _, _, _ = make_bridge(
+        monkeypatch,
+        pa2_host="192.0.2.20",
+    )
+
+    def discover(host: str) -> str:
+        discovered_hosts.append(host)
+        return mac_address
+
+    monkeypatch.setattr("pa2bridge.mqtt_bridge._discover_mac_address", discover)
+
+    first._connect_pa2()
+    second._connect_pa2()
+
+    assert discovered_hosts == ["192.0.2.10", "192.0.2.20"]
+    assert first.device.identifier == "driverack_pa2_02005e100001"
+    assert second.device.identifier == first.device.identifier
+    assert [message.topic for message in second.discovery] == [
+        message.topic for message in first.discovery
+    ]
+
+
+def test_discovers_complete_unicast_mac_for_configured_ipv4_address(tmp_path: Path) -> None:
+    arp_path = tmp_path / "arp"
+    arp_path.write_text(
+        "IP address HW type Flags HW address Mask Device\n"
+        "192.0.2.20 0x1 0x0 02:00:5e:10:00:02 * eth0\n"
+        "192.0.2.20 0x1 0x2 02:00:5E:10:00:01 * eth0\n",
+        encoding="ascii",
+    )
+
+    assert _discover_mac_address("192.0.2.20", arp_path=arp_path) == (
+        "02:00:5e:10:00:01"
+    )
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        "192.0.2.20 0x2 0x2 02:00:5e:10:00:01 * eth0\n",
+        "192.0.2.20 0x1 -0x2 02:00:5e:10:00:01 * eth0\n",
+        "192.0.2.20 0x1 invalid 02:00:5e:10:00:01 * eth0\n",
+    ],
+)
+def test_neighbor_discovery_rejects_unsupported_hardware_and_flags(
+    tmp_path: Path,
+    row: str,
+) -> None:
+    arp_path = tmp_path / "arp"
+    arp_path.write_text(
+        "IP address HW type Flags HW address Mask Device\n" + row,
+        encoding="ascii",
+    )
+
+    assert _discover_mac_address("192.0.2.20", arp_path=arp_path) is None
+
+
+def test_neighbor_discovery_rejects_conflicting_entries(tmp_path: Path) -> None:
+    arp_path = tmp_path / "arp"
+    arp_path.write_text(
+        "IP address HW type Flags HW address Mask Device\n"
+        "192.0.2.20 0x1 0x2 02:00:5e:10:00:01 * eth0\n"
+        "192.0.2.20 0x1 0x2 02:00:5e:10:00:02 * eth1\n",
+        encoding="ascii",
+    )
+
+    with pytest.raises(DiscoveryStateError, match="conflicting PA2 MAC"):
+        _discover_mac_address("192.0.2.20", arp_path=arp_path)
+
+
+def test_neighbor_discovery_rejects_oversized_table(tmp_path: Path) -> None:
+    arp_path = tmp_path / "arp"
+    arp_path.write_bytes(b"x" * (64 * 1024 + 1))
+
+    assert _discover_mac_address("192.0.2.20", arp_path=arp_path) is None
+
+
+def test_hostname_with_multiple_ipv4_addresses_is_not_auto_correlated(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        "pa2bridge.mqtt_bridge.socket.getaddrinfo",
+        lambda *args, **kwargs: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.0.2.20", 0)),
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.0.2.21", 0)),
+        ],
+    )
+
+    assert _resolve_ipv4_addresses("pa2.example.test") == set()
+
+
+def test_automatic_mac_identity_uses_configured_pa2_address(monkeypatch) -> None:
+    bridge, _, _, _ = make_bridge(monkeypatch, pa2_host="192.0.2.20")
+    calls: list[str] = []
+
+    def discover(host: str) -> str:
+        calls.append(host)
+        return "02:00:5e:10:00:01"
+
+    monkeypatch.setattr("pa2bridge.mqtt_bridge._discover_mac_address", discover)
+
+    bridge._connect_pa2()
+
+    assert calls == ["192.0.2.20"]
+    assert bridge.device is not None
+    assert bridge.device.identifier == "driverack_pa2_02005e100001"
+    assert bridge.device.mac_address == "02:00:5e:10:00:01"
+
+
+def test_automatic_mac_identity_uses_authenticated_tcp_peer(monkeypatch) -> None:
+    bridge, _, pa2, _ = make_bridge(monkeypatch, pa2_host="pa2.example.test")
+    pa2.peer_ipv4 = "192.0.2.20"
+    calls: list[str] = []
+
+    def discover(host: str) -> str:
+        calls.append(host)
+        return "02:00:5e:10:00:01"
+
+    monkeypatch.setattr("pa2bridge.mqtt_bridge._discover_mac_address", discover)
+
+    bridge._connect_pa2()
+
+    assert calls == ["192.0.2.20"]
+    assert bridge.device is not None
+    assert bridge.device.identifier == "driverack_pa2_02005e100001"
+
+
+def test_automatic_mac_identity_fails_closed_after_lookup_failure(
+    monkeypatch,
+) -> None:
+    bridge, _, pa2, _ = make_bridge(monkeypatch, pa2_host="192.0.2.20")
+    results = iter(("02:00:5e:10:00:01", None))
+    monkeypatch.setattr(
+        "pa2bridge.mqtt_bridge._discover_mac_address",
+        lambda host: next(results),
+    )
+
+    bridge._connect_pa2()
+    assert bridge.device is not None
+    first_identifier = bridge.device.identifier
+    pa2.connection_generation += 1
+    bridge._pa2_identity = None
+    with pytest.raises(IdentityRevalidationUnavailable, match="could not be revalidated"):
+        bridge._identity_for_connection()
+
+    assert first_identifier == "driverack_pa2_02005e100001"
+
+
+def test_address_fallback_never_authorizes_reconnect(monkeypatch) -> None:
+    bridge, _, _, _ = make_bridge(monkeypatch)
+    bridge._connect_pa2()
+
+    with pytest.raises(ConnectionValidationError, match="without a stable MAC"):
+        bridge._validate_reconnected_peer(time.monotonic() + 5)
+
+
+def test_automatic_mac_identity_survives_address_change_when_revalidated(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    state_path = tmp_path / "discovery-state.json"
+    first, _, _, _ = make_bridge(
+        monkeypatch,
+        pa2_host="192.0.2.20",
+        discovery_state_path=state_path,
+    )
+    monkeypatch.setattr(
+        "pa2bridge.mqtt_bridge._discover_mac_address",
+        lambda host: "02:00:5e:10:00:01",
+    )
+    first._connect_pa2()
+    first._publish_discovery(first.discovery)
+
+    second, _, _, _ = make_bridge(
+        monkeypatch,
+        pa2_host="192.0.2.99",
+        discovery_state_path=state_path,
+    )
+    monkeypatch.setattr(
+        "pa2bridge.mqtt_bridge._discover_mac_address",
+        lambda host: "02:00:5e:10:00:01",
+    )
+    second._connect_pa2()
+
+    assert second.device is not None
+    assert second.device.identifier == "driverack_pa2_02005e100001"
+
+
+def test_persisted_mac_identity_fails_closed_on_restart_lookup_failure(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    state_path = tmp_path / "discovery-state.json"
+    first, _, _, _ = make_bridge(
+        monkeypatch,
+        pa2_host="192.0.2.20",
+        discovery_state_path=state_path,
+    )
+    monkeypatch.setattr(
+        "pa2bridge.mqtt_bridge._discover_mac_address",
+        lambda host: "02:00:5e:10:00:01",
+    )
+    first._connect_pa2()
+    identity_state = state_path.with_name("identity.json")
+    assert json.loads(identity_state.read_text(encoding="utf-8")) == {
+        "version": 1,
+        "host": "192.0.2.20",
+        "mac_address": "02:00:5e:10:00:01",
+    }
+    assert stat.S_IMODE(identity_state.stat().st_mode) == 0o600
+
+    second, _, _, _ = make_bridge(
+        monkeypatch,
+        pa2_host="192.0.2.20",
+        discovery_state_path=state_path,
+    )
+    with pytest.raises(IdentityRevalidationUnavailable, match="could not be revalidated"):
+        second._connect_pa2()
+
+
+def test_persisted_mac_identity_rejects_conflicting_rediscovery(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    state_path = tmp_path / "discovery-state.json"
+    first, _, _, _ = make_bridge(
+        monkeypatch,
+        discovery_state_path=state_path,
+    )
+    monkeypatch.setattr(
+        "pa2bridge.mqtt_bridge._discover_mac_address",
+        lambda host: "02:00:5e:10:00:01",
+    )
+    first._connect_pa2()
+
+    second, _, _, _ = make_bridge(
+        monkeypatch,
+        discovery_state_path=state_path,
+    )
+    monkeypatch.setattr(
+        "pa2bridge.mqtt_bridge._discover_mac_address",
+        lambda host: "02:00:5e:10:00:02",
+    )
+
+    with pytest.raises(DiscoveryStateError, match="conflicts with persisted"):
+        second._connect_pa2()
+
+
+def test_explicit_mac_override_rejects_persisted_identity_conflict(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    state_path = tmp_path / "discovery-state.json"
+    first, _, _, _ = make_bridge(
+        monkeypatch,
+        discovery_state_path=state_path,
+    )
+    monkeypatch.setattr(
+        "pa2bridge.mqtt_bridge._discover_mac_address",
+        lambda host: "02:00:5e:10:00:01",
+    )
+    first._connect_pa2()
+
+    second, _, _, _ = make_bridge(
+        monkeypatch,
+        discovery_state_path=state_path,
+        pa2_mac_address="02:00:5e:10:00:02",
+    )
+
+    with pytest.raises(DiscoveryStateError, match="configured.*conflicts"):
+        second._connect_pa2()
+
+
+def test_explicit_replacement_updates_persisted_identity(monkeypatch, tmp_path: Path) -> None:
+    state_path = tmp_path / "discovery-state.json"
+    first, _, _, _ = make_bridge(
+        monkeypatch,
+        discovery_state_path=state_path,
+    )
+    monkeypatch.setattr(
+        "pa2bridge.mqtt_bridge._discover_mac_address",
+        lambda host: "02:00:5e:10:00:01",
+    )
+    first._connect_pa2()
+    first._publish_discovery(first.discovery)
+    identity_path = state_path.with_name("identity.json")
+
+    second, _, _, _ = make_bridge(
+        monkeypatch,
+        discovery_state_path=state_path,
+        pa2_mac_address="02:00:5e:10:00:02",
+        replace_saved_identity=True,
+    )
+    monkeypatch.setattr(
+        "pa2bridge.mqtt_bridge._discover_mac_address",
+        lambda host: "02:00:5e:10:00:02",
+    )
+    second._connect_pa2()
+
+    assert second.device is not None
+    assert second.device.identifier == "driverack_pa2_02005e100002"
+    assert json.loads(identity_path.read_text())["mac_address"] == "02:00:5e:10:00:01"
+
+    real_wait = second._wait_for_discovery_publications
+    wait_calls = 0
+
+    def fail_current_publications(results, *, deadline):
+        nonlocal wait_calls
+        wait_calls += 1
+        if wait_calls == 2:
+            raise MqttPublishError("current discovery was not acknowledged")
+        return real_wait(results, deadline=deadline)
+
+    monkeypatch.setattr(second, "_wait_for_discovery_publications", fail_current_publications)
+    with pytest.raises(MqttPublishError, match="not acknowledged"):
+        second._publish_discovery(second.discovery)
+    assert json.loads(identity_path.read_text())["mac_address"] == "02:00:5e:10:00:01"
+
+    monkeypatch.setattr(second, "_wait_for_discovery_publications", real_wait)
+    second._publish_discovery(second.discovery)
+    assert json.loads(identity_path.read_text()) == {
+        "version": 1,
+        "host": "192.0.2.20",
+        "mac_address": "02:00:5e:10:00:02",
+    }
+
+
+def test_identity_state_loader_rejects_symlink(tmp_path: Path) -> None:
+    target = tmp_path / "outside.json"
+    target.write_text(
+        '{"host":"192.0.2.20","mac_address":"02:00:5e:10:00:01","version":1}\n',
+        encoding="utf-8",
+    )
+    target.chmod(0o600)
+    link = tmp_path / "identity.json"
+    link.symlink_to(target)
+
+    with pytest.raises(DiscoveryStateError, match="could not read identity state"):
+        _load_identity_state(link)
+
+
+def test_address_change_without_mac_revalidation_stops_identity_churn(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    state_path = tmp_path / "discovery-state.json"
+    first, _, _, _ = make_bridge(
+        monkeypatch,
+        pa2_host="192.0.2.20",
+        discovery_state_path=state_path,
+    )
+    monkeypatch.setattr(
+        "pa2bridge.mqtt_bridge._discover_mac_address",
+        lambda host: "02:00:5e:10:00:01",
+    )
+    first._connect_pa2()
+
+    second, _, _, _ = make_bridge(
+        monkeypatch,
+        pa2_host="192.0.2.99",
+        discovery_state_path=state_path,
+    )
+
+    with pytest.raises(IdentityRevalidationUnavailable, match="could not be revalidated"):
+        second._connect_pa2()
+
+
+def test_home_assistant_network_data_resolves_mac_across_layer_three(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        "pa2bridge.mqtt_bridge._trusted_home_assistant_trackers",
+        lambda entity_ids, token, *, timeout, deadline: entity_ids,
+    )
+    response = json.dumps(
+        [
+            {
+                "entity_id": "device_tracker.synthetic_pa2",
+                "state": "home",
+                "last_reported": TRACKER_TIMESTAMP,
+                "attributes": {
+                    "source_type": "router",
+                    "tracking_type": "connection",
+                    "authorized": True,
+                    "ip": "192.0.2.20",
+                    "mac": "02-00-5E-10-00-01",
+                },
+            },
+            {
+                "entity_id": "device_tracker.other",
+                "state": "home",
+                "last_reported": TRACKER_TIMESTAMP,
+                "attributes": {
+                    "source_type": "router",
+                    "tracking_type": "connection",
+                    "authorized": True,
+                    "ip": "192.0.2.21",
+                    "mac": "02:00:5e:10:00:02",
+                },
+            },
+        ]
+    ).encode()
+    requests = []
+    read_sizes: list[int] = []
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self, size: int) -> bytes:
+            read_sizes.append(size)
+            assert size > len(response)
+            return response
+
+    def urlopen(request, *, timeout):
+        requests.append((request, timeout))
+        return Response()
+
+    monkeypatch.setattr("pa2bridge.mqtt_bridge.urlopen", urlopen)
+
+    assert _discover_mac_address_from_home_assistant(
+        "192.0.2.20",
+        "synthetic-supervisor-token",
+    ) == "02:00:5e:10:00:01"
+    request, timeout = requests[0]
+    assert request.full_url == "http://supervisor/core/api/states"
+    assert request.headers["Authorization"] == "Bearer synthetic-supervisor-token"
+    assert 0 < timeout <= 3.0
+    assert read_sizes == [16 * 1024 * 1024 + 1]
+
+
+def test_home_assistant_network_data_rejects_oversized_response(monkeypatch) -> None:
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self, size: int) -> bytes:
+            return b"x" * size
+
+    monkeypatch.setattr(
+        "pa2bridge.mqtt_bridge.urlopen",
+        lambda request, *, timeout: Response(),
+    )
+
+    assert (
+        _discover_mac_address_from_home_assistant(
+            "192.0.2.20",
+            "synthetic-supervisor-token",
+        )
+        is None
+    )
+
+
+def test_home_assistant_network_data_rejects_conflicting_mac_matches(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        "pa2bridge.mqtt_bridge._trusted_home_assistant_trackers",
+        lambda entity_ids, token, *, timeout, deadline: entity_ids,
+    )
+    response = json.dumps(
+        [
+            {
+                "entity_id": "device_tracker.first",
+                "state": "home",
+                "last_reported": TRACKER_TIMESTAMP,
+                "attributes": {
+                    "source_type": "router",
+                    "tracking_type": "connection",
+                    "authorized": True,
+                    "ip": "192.0.2.20",
+                    "mac": "02:00:5e:10:00:01",
+                },
+            },
+            {
+                "entity_id": "device_tracker.second",
+                "state": "home",
+                "last_reported": TRACKER_TIMESTAMP,
+                "attributes": {
+                    "source_type": "router",
+                    "tracking_type": "connection",
+                    "authorized": True,
+                    "ip": "192.0.2.20",
+                    "mac": "02:00:5e:10:00:02",
+                },
+            },
+        ]
+    ).encode()
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self, size: int) -> bytes:
+            del size
+            return response
+
+    monkeypatch.setattr(
+        "pa2bridge.mqtt_bridge.urlopen",
+        lambda request, *, timeout: Response(),
+    )
+
+    with pytest.raises(DiscoveryStateError, match="conflicting PA2 MAC"):
+        _discover_mac_address_from_home_assistant(
+            "192.0.2.20",
+            "synthetic-supervisor-token",
+        )
+
+
+@pytest.mark.parametrize(
+    (
+        "entity_id",
+        "state",
+        "source_type",
+        "tracking_type",
+        "authorized",
+        "last_reported",
+    ),
+    [
+        ("sensor.synthetic", "home", "router", "connection", True, TRACKER_TIMESTAMP),
+        (
+            "device_tracker.synthetic",
+            "unavailable",
+            "router",
+            "connection",
+            True,
+            TRACKER_TIMESTAMP,
+        ),
+        (
+            "device_tracker.synthetic",
+            "home",
+            "gps",
+            "connection",
+            True,
+            TRACKER_TIMESTAMP,
+        ),
+        (
+            "device_tracker.synthetic",
+            "home",
+            "router",
+            "presence",
+            True,
+            TRACKER_TIMESTAMP,
+        ),
+        (
+            "device_tracker.synthetic",
+            "home",
+            "router",
+            "connection",
+            False,
+            TRACKER_TIMESTAMP,
+        ),
+        (
+            "device_tracker.synthetic",
+            "home",
+            "router",
+            "connection",
+            True,
+            STALE_TRACKER_TIMESTAMP,
+        ),
+        (
+            "device_tracker.synthetic",
+            "home",
+            "router",
+            "connection",
+            True,
+            "0001-01-01T00:00:00+14:00",
+        ),
+    ],
+)
+def test_home_assistant_network_data_rejects_untrusted_state_sources(
+    monkeypatch,
+    entity_id: str,
+    state: str,
+    source_type: str,
+    tracking_type: str,
+    authorized: bool,
+    last_reported: str,
+) -> None:
+    response = json.dumps(
+        [
+            {
+                "entity_id": entity_id,
+                "state": state,
+                "last_reported": last_reported,
+                "attributes": {
+                    "source_type": source_type,
+                    "tracking_type": tracking_type,
+                    "authorized": authorized,
+                    "ip": "192.0.2.20",
+                    "mac": "02:00:5e:10:00:01",
+                },
+            }
+        ]
+    ).encode()
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self, size: int) -> bytes:
+            del size
+            return response
+
+    monkeypatch.setattr(
+        "pa2bridge.mqtt_bridge.urlopen",
+        lambda request, *, timeout: Response(),
+    )
+
+    assert (
+        _discover_mac_address_from_home_assistant(
+            "192.0.2.20",
+            "synthetic-supervisor-token",
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize("trusted_domain", ["unifi", "unifi_insights"])
+def test_home_assistant_tracker_provenance_allows_only_network_integrations(
+    monkeypatch,
+    trusted_domain: str,
+) -> None:
+    entity_ids = frozenset(
+        {
+            "device_tracker.unifi_pa2",
+            "device_tracker.synthetic_template",
+        }
+    )
+    responses = iter(
+        (
+            json.dumps(
+                {
+                    "device_tracker.unifi_pa2": "trusted-entry",
+                    "device_tracker.synthetic_template": "untrusted-entry",
+                }
+            ).encode(),
+            json.dumps(
+                [
+                    {"entry_id": "trusted-entry", "domain": trusted_domain},
+                    {"entry_id": "untrusted-entry", "domain": "template"},
+                ]
+            ).encode(),
+        )
+    )
+    requests = []
+    timeouts = []
+    monotonic_values = iter((100.0, 102.0))
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self, size: int) -> bytes:
+            payload = next(responses)
+            assert len(payload) < size
+            return payload
+
+    def urlopen(request, *, timeout):
+        requests.append(request)
+        timeouts.append(timeout)
+        return Response()
+
+    monkeypatch.setattr("pa2bridge.mqtt_bridge.urlopen", urlopen)
+    monkeypatch.setattr(
+        "pa2bridge.mqtt_bridge.time.monotonic",
+        lambda: next(monotonic_values),
+    )
+
+    assert _trusted_home_assistant_trackers(
+        entity_ids,
+        "synthetic-supervisor-token",
+        timeout=3.0,
+        deadline=103.0,
+    ) == frozenset({"device_tracker.unifi_pa2"})
+    assert requests[0].full_url == "http://supervisor/core/api/template"
+    assert requests[0].get_method() == "POST"
+    assert requests[1].full_url.endswith("/api/config/config_entries/entry")
+    assert timeouts == [3.0, 1.0]
+
+
+def test_home_assistant_network_requests_share_one_absolute_deadline(
+    monkeypatch,
+) -> None:
+    states = json.dumps(
+        [
+            {
+                "entity_id": "device_tracker.unifi_pa2",
+                "state": "home",
+                "last_reported": TRACKER_TIMESTAMP,
+                "attributes": {
+                    "source_type": "router",
+                    "tracking_type": "connection",
+                    "authorized": True,
+                    "ip": "192.0.2.20",
+                    "mac": "02:00:5e:10:00:01",
+                },
+            }
+        ]
+    ).encode()
+    mapping = json.dumps(
+        {"device_tracker.unifi_pa2": "trusted-entry"}
+    ).encode()
+    entries = json.dumps(
+        [{"entry_id": "trusted-entry", "domain": "unifi"}]
+    ).encode()
+    responses = iter((states, mapping, entries))
+    monotonic_values = iter((100.0, 103.0, 104.0))
+    timeouts = []
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self, size: int) -> bytes:
+            payload = next(responses)
+            assert len(payload) < size
+            return payload
+
+    def urlopen(request, *, timeout):
+        timeouts.append(timeout)
+        return Response()
+
+    monkeypatch.setattr("pa2bridge.mqtt_bridge.urlopen", urlopen)
+    monkeypatch.setattr(
+        "pa2bridge.mqtt_bridge.time.monotonic",
+        lambda: next(monotonic_values),
+    )
+
+    assert _discover_mac_address_from_home_assistant(
+        "192.0.2.20",
+        "synthetic-supervisor-token",
+        timeout=3.0,
+        deadline=105.0,
+    ) == "02:00:5e:10:00:01"
+    assert timeouts == [3.0, 2.0, 1.0]
+
+
+def test_home_assistant_network_data_rejects_untrusted_tracker_provenance(
+    monkeypatch,
+) -> None:
+    states = json.dumps(
+        [
+            {
+                "entity_id": "device_tracker.synthetic_template",
+                "state": "home",
+                "last_reported": TRACKER_TIMESTAMP,
+                "attributes": {
+                    "source_type": "router",
+                    "tracking_type": "connection",
+                    "authorized": True,
+                    "ip": "192.0.2.20",
+                    "mac": "02:00:5e:10:00:01",
+                },
+            }
+        ]
+    ).encode()
+    mapping = json.dumps(
+        {"device_tracker.synthetic_template": "untrusted-entry"}
+    ).encode()
+    entries = json.dumps(
+        [{"entry_id": "untrusted-entry", "domain": "template"}]
+    ).encode()
+
+    class Response:
+        def __init__(self, payload: bytes) -> None:
+            self.payload = payload
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self, size: int) -> bytes:
+            assert len(self.payload) < size
+            return self.payload
+
+    def urlopen(request, *, timeout):
+        if request.full_url.endswith("/api/states"):
+            return Response(states)
+        if request.full_url.endswith("/api/template"):
+            return Response(mapping)
+        return Response(entries)
+
+    monkeypatch.setattr("pa2bridge.mqtt_bridge.urlopen", urlopen)
+
+    assert (
+        _discover_mac_address_from_home_assistant(
+            "192.0.2.20",
+            "synthetic-supervisor-token",
+        )
+        is None
+    )
+
+
+def test_bridge_uses_home_assistant_mac_when_local_arp_cannot_cross_router(
+    monkeypatch,
+) -> None:
+    bridge, _, _, _ = make_bridge(
+        monkeypatch,
+        pa2_host="192.0.2.20",
+        home_assistant_token="synthetic-supervisor-token",
+    )
+    calls: list[tuple[str, str]] = []
+
+    def discover_from_ha(
+        host: str,
+        token: str,
+        *,
+        timeout: float,
+        deadline: float | None,
+    ) -> str:
+        assert timeout <= 3.0
+        assert deadline is not None
+        calls.append((host, token))
+        return "02:00:5e:10:00:01"
+
+    monkeypatch.setattr(
+        "pa2bridge.mqtt_bridge._discover_mac_address_from_home_assistant",
+        discover_from_ha,
+    )
+
+    bridge._connect_pa2()
+
+    assert calls == [("192.0.2.20", "synthetic-supervisor-token")]
+    assert bridge.device is not None
+    assert bridge.device.identifier == "driverack_pa2_02005e100001"
+
+
+def test_explicit_mac_override_is_used_when_live_discovery_is_unavailable(
+    monkeypatch,
+) -> None:
+    bridge, _, _, _ = make_bridge(
+        monkeypatch,
+        pa2_mac_address="02:00:5e:10:00:01",
+        home_assistant_token="synthetic-supervisor-token",
+    )
+    calls: list[str] = []
+
+    def unavailable_locally(host: str) -> None:
+        calls.append("local")
+        return None
+
+    def unavailable_in_ha(
+        host: str,
+        token: str,
+        *,
+        timeout: float,
+        deadline: float | None,
+    ) -> None:
+        assert deadline is not None
+        calls.append("ha")
+        return None
+
+    monkeypatch.setattr(
+        "pa2bridge.mqtt_bridge._discover_mac_address",
+        unavailable_locally,
+    )
+    monkeypatch.setattr(
+        "pa2bridge.mqtt_bridge._discover_mac_address_from_home_assistant",
+        unavailable_in_ha,
+    )
+
+    bridge._connect_pa2()
+
+    assert bridge.device is not None
+    assert bridge.device.identifier == "driverack_pa2_02005e100001"
+    assert calls == ["local", "ha"]
+
+
+def test_explicit_mac_override_rejects_conflicting_live_peer(monkeypatch) -> None:
+    bridge, _, _, _ = make_bridge(
+        monkeypatch,
+        pa2_mac_address="02:00:5e:10:00:01",
+    )
+    monkeypatch.setattr(
+        "pa2bridge.mqtt_bridge._discover_mac_address",
+        lambda host: "02:00:5e:10:00:02",
+    )
+
+    with pytest.raises(DiscoveryStateError, match="conflicts with the connected peer"):
+        bridge._connect_pa2()
+
+
+def test_local_mac_discovery_skips_home_assistant_fallback(monkeypatch) -> None:
+    bridge, _, _, _ = make_bridge(
+        monkeypatch,
+        home_assistant_token="synthetic-supervisor-token",
+    )
+    monkeypatch.setattr(
+        "pa2bridge.mqtt_bridge._discover_mac_address",
+        lambda host: "02:00:5e:10:00:01",
+    )
+    monkeypatch.setattr(
+        "pa2bridge.mqtt_bridge._discover_mac_address_from_home_assistant",
+        lambda host, token, *, timeout, deadline: pytest.fail(
+            "Home Assistant discovery must not run"
+        ),
+    )
+
+    bridge._connect_pa2()
+
+    assert bridge.device is not None
+    assert bridge.device.identifier == "driverack_pa2_02005e100001"
+
+
+def test_healthy_startup_logs_mqtt_pa2_and_discovery_milestones(
+    monkeypatch,
+    caplog,
+) -> None:
+    bridge, client, _, _ = make_bridge(
+        monkeypatch,
+        pa2_mac_address="02:00:5e:10:00:01",
+    )
+    caplog.set_level("INFO", logger="pa2bridge.mqtt_bridge")
+
+    bridge._mqtt_connected = False
+    original_poll = bridge._poll_once
+
+    def poll_once_and_stop() -> None:
+        original_poll()
+        bridge._stop_event.set()
+
+    monkeypatch.setattr(bridge, "_poll_once", poll_once_and_stop)
+
+    bridge.run_forever()
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert messages == [
+        "connected to MQTT broker; command subscription ready",
+        "connected to PA2 'DriveRackPA2' at 192.0.2.20:19272 "
+        "(firmware '1.2.0.1'); 2 presets available",
+        "published MQTT discovery for 'DriveRackPA2': 12 entities, "
+        "0 stale topics removed",
+    ]
+    assert "pa2-secret" not in caplog.text
+    assert "mqtt-secret" not in caplog.text
+
+
+def test_transient_identity_revalidation_failure_retries_without_app_exit(
+    monkeypatch,
+    caplog,
+) -> None:
+    bridge, _, _, _ = make_bridge(monkeypatch)
+    caplog.set_level("WARNING", logger="pa2bridge.mqtt_bridge")
+
+    def temporary_failure() -> None:
+        bridge._stop_event.set()
+        raise IdentityRevalidationUnavailable("network tracker temporarily unavailable")
+
+    monkeypatch.setattr(bridge, "_poll_once", temporary_failure)
+
+    bridge.run_forever()
+
+    assert any(
+        "retrying safely" in record.getMessage() and "optional PA2 MAC" in record.getMessage()
+        for record in caplog.records
+    )
 
 
 def test_discovery_publish_clears_persisted_old_topics_before_current_topics(
@@ -381,6 +1403,53 @@ def test_discovery_publish_clears_persisted_old_topics_before_current_topics(
     assert persisted == {"version": 1, "topics": expected_topics}
     assert all(topic not in persisted["topics"] for topic in old_topics)
     assert stat.S_IMODE(state_path.stat().st_mode) == 0o600
+
+
+def test_mac_migration_clears_host_identity_before_publishing_current_topics(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    state_path = tmp_path / "discovery-state.json"
+    old_bridge, _, _, _ = make_bridge(
+        monkeypatch,
+        pa2_host="192.0.2.20",
+        discovery_state_path=state_path,
+    )
+    old_bridge._connect_pa2()
+    old_bridge._publish_discovery(old_bridge.discovery)
+    old_topics = sorted(message.topic for message in old_bridge.discovery if message.payload)
+
+    bridge, client, _, _ = make_bridge(
+        monkeypatch,
+        pa2_host="192.0.2.20",
+        pa2_mac_address="02:00:5e:10:00:01",
+        discovery_state_path=state_path,
+    )
+    bridge._connect_pa2()
+    bridge._publish_discovery(bridge.discovery)
+
+    current_topics = sorted(message.topic for message in bridge.discovery if message.payload)
+    config_publishes = [
+        (topic, payload)
+        for topic, payload, _, retain in client.published
+        if topic.endswith("/config") and retain
+    ]
+    assert config_publishes[: len(old_topics)] == [
+        (topic, "") for topic in old_topics
+    ]
+    assert all(topic.startswith("homeassistant/") for topic in current_topics)
+    assert all("driverack_pa2_02005e100001" in topic for topic in current_topics)
+    first_current_publish = min(
+        client.events.index(("publish", topic, payload))
+        for topic, payload in config_publishes
+        if payload
+    )
+    last_old_ack = max(client.events.index(("wait", topic)) for topic in old_topics)
+    assert last_old_ack < first_current_publish
+    assert json.loads(state_path.read_text(encoding="utf-8")) == {
+        "version": 1,
+        "topics": current_topics,
+    }
 
 
 @pytest.mark.parametrize(

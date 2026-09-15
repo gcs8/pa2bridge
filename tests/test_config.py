@@ -49,6 +49,55 @@ password_env = "MQTT_PASSWORD"
     assert "secret" not in repr(config)
 
 
+def test_load_config_normalizes_pa2_mac_address(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text(
+        _config_text(pa2_extra='mac_address="02-00-5E-10-00-01"\n'),
+        encoding="utf-8",
+    )
+
+    config = load_config(path, environ={})
+
+    assert config.pa2.mac_address == "02:00:5e:10:00:01"
+
+
+def test_replace_saved_identity_requires_explicit_mac(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text(
+        _config_text(pa2_extra="replace_saved_identity=true\n"),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="requires.*mac_address"):
+        load_config(path, environ={})
+
+
+@pytest.mark.parametrize(
+    "mac_address",
+    [
+        "02:00:5e:10:00",
+        "02:00:5e:10:00:gg",
+        "02:00-5e:10:00:01",
+        " 02:00:5e:10:00:01",
+        "00:00:00:00:00:00",
+        "01:00:5e:10:00:01",
+        "ff:ff:ff:ff:ff:ff",
+    ],
+)
+def test_load_config_rejects_invalid_pa2_mac_address(
+    tmp_path: Path,
+    mac_address: str,
+) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text(
+        _config_text(pa2_extra=f'mac_address="{mac_address}"\n'),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="MAC address"):
+        load_config(path, environ={})
+
+
 @pytest.mark.parametrize(("section", "invalid_host"), [("pa2", "pa2/bridge"), ("mqtt", "broker/#")])
 def test_load_config_rejects_hosts_that_are_not_ascii_hostnames_or_ip_addresses(
     tmp_path: Path, section: str, invalid_host: str

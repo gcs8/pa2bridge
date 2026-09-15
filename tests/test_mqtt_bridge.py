@@ -36,6 +36,26 @@ def test_discovery_creates_preset_select_that_uses_verified_state_and_nonretaine
     assert config["retain"] is False
 
 
+def test_discovery_uses_mac_connection_for_home_assistant_device_matching() -> None:
+    messages = build_discovery_messages(
+        device=DeviceInfo(
+            identifier="driverack_pa2_02005e100001",
+            name="DriveRackPA2",
+            firmware="1.2.0.1",
+            mac_address="02:00:5e:10:00:01",
+        ),
+        presets=[Preset(1, "Flat")],
+        base_topic="driverack/pa2",
+        discovery_prefix="homeassistant",
+        expose_meters=False,
+    )
+
+    payload = json.loads(next(message.payload for message in messages if message.payload))
+
+    assert payload["device"]["identifiers"] == ["driverack_pa2_02005e100001"]
+    assert payload["device"]["connections"] == [["mac", "02:00:5e:10:00:01"]]
+
+
 def test_discovery_creates_unmute_button_and_six_mute_switches() -> None:
     payloads = _payloads_by_topic()
 

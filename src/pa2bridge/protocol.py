@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import ipaddress
 import re
 import socket
 import threading
@@ -132,6 +133,7 @@ class HiQnetClient:
         self._lock = threading.RLock()
         self._credentials: tuple[str, str] | None = None
         self._connection_generation = 0
+        self._peer_ipv4: str | None = None
 
     @property
     def connected(self) -> bool:
@@ -142,6 +144,12 @@ class HiQnetClient:
         """Identify the current successfully authenticated console session."""
 
         return self._connection_generation
+
+    @property
+    def peer_ipv4(self) -> str | None:
+        """Return the IPv4 address of the current authenticated TCP peer."""
+
+        return self._peer_ipv4 if self._credentials is not None else None
 
     def connect(self, username: str = "administrator", password: str = "administrator") -> None:
         self._connect(
@@ -187,6 +195,12 @@ class HiQnetClient:
             except OSError as error:
                 raise ProtocolError(f"could not connect to {self.host}:{self.port}: {error}") from error
             self._socket = sock
+            try:
+                peer = sock.getpeername()
+                address = ipaddress.ip_address(peer[0])
+                self._peer_ipv4 = str(address) if address.version == 4 else None
+            except (AttributeError, IndexError, OSError, TypeError, ValueError):
+                self._peer_ipv4 = None
             self._buffer.clear()
             self._pending_set_echoes.clear()
             self._send(f'connect {username} "{password}"', deadline=deadline)
@@ -240,6 +254,7 @@ class HiQnetClient:
     def close(self) -> None:
         with self._lock:
             sock, self._socket = self._socket, None
+            self._peer_ipv4 = None
             self._buffer.clear()
             self._pending_set_echoes.clear()
             if sock is not None:

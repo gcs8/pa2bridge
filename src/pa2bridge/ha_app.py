@@ -20,6 +20,7 @@ from .config import (
     MqttConfig,
     Pa2Config,
     has_disallowed_mqtt_codepoint,
+    normalize_mac_address,
     pa2_password,
     pa2_username,
     parse_allowed_preset_slots,
@@ -30,6 +31,7 @@ from .mqtt_bridge import DiscoveryStateError, MqttBridge, MqttPublishError
 
 
 LOGGER = logging.getLogger(__name__)
+_MAX_SUPERVISOR_TOKEN_LENGTH = 8192
 
 _ALLOWED_OPTION_KEYS = {
     "allowed_preset_slots",
@@ -38,6 +40,7 @@ _ALLOWED_OPTION_KEYS = {
     "discovery_prefix",
     "expose_meters",
     "pa2_host",
+    "pa2_mac_address",
     "pa2_password",
     "pa2_password_override",
     "pa2_port",
@@ -46,6 +49,7 @@ _ALLOWED_OPTION_KEYS = {
     "post_recall_delay",
     "preset_slots",
     "recall_timeout",
+    "replace_saved_identity",
     "state_poll_interval",
 }
 
@@ -55,6 +59,19 @@ def _required_string(values: Mapping[str, Any], key: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ConfigError(f"Home Assistant option {key} must be a non-empty string")
     return value.strip()
+
+
+def _supervisor_token(environ: Mapping[str, str]) -> str | None:
+    token = environ.get("SUPERVISOR_TOKEN")
+    if token is None:
+        return None
+    if (
+        not token
+        or len(token) > _MAX_SUPERVISOR_TOKEN_LENGTH
+        or any(ord(character) < 0x20 or ord(character) == 0x7F for character in token)
+    ):
+        raise ConfigError("Home Assistant Supervisor token is invalid")
+    return token
 
 
 def _port(values: Mapping[str, Any], key: str, *, default: int) -> int:
@@ -210,6 +227,16 @@ def load_ha_app_config(
             _required_string(options, "pa2_host"),
             description="Home Assistant option pa2_host",
         ),
+        mac_address=normalize_mac_address(
+            options.get("pa2_mac_address", ""),
+            description="Home Assistant option pa2_mac_address",
+            allow_empty=True,
+        ),
+        replace_saved_identity=_boolean(
+            options,
+            "replace_saved_identity",
+            default=False,
+        ),
         port=_port(options, "pa2_port", default=19272),
         username=pa2_username(
             _required_string(options, "pa2_username"),
@@ -247,6 +274,10 @@ def load_ha_app_config(
             allow_minimum=True,
         ),
     )
+    if pa2.replace_saved_identity and pa2.mac_address is None:
+        raise ConfigError(
+            "Home Assistant option replace_saved_identity requires pa2_mac_address"
+        )
     mqtt = MqttConfig(
         host=_mqtt_service_host(environment),
         port=_mqtt_service_port(environment),
@@ -285,8 +316,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     try:
         MqttBridge(
-            load_ha_app_config(args.options),
+            load_ha_app_config(args.options, environ=os.environ),
             discovery_state_path=Path("/data/discovery.json"),
+            home_assistant_token=_supervisor_token(os.environ),
         ).run_forever()
         return 0
     except (ConfigError, DiscoveryStateError, MqttPublishError) as error:

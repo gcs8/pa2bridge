@@ -122,6 +122,10 @@ class OutputVerificationError(RuntimeError):
     """One or more output mute readbacks did not match the request."""
 
 
+class ConnectionValidationError(RuntimeError):
+    """A reconnected PA2 could not be verified as the expected physical device."""
+
+
 class RollbackDeadlineError(OutputVerificationError, RecallTimeout):
     """Rollback could not continue without exceeding the absolute recall deadline."""
 
@@ -265,6 +269,7 @@ class Pa2Controller:
         post_recall_delay: float = 1.0,
         sleep: Callable[[float], None] = time.sleep,
         monotonic: Callable[[], float] = time.monotonic,
+        reconnect_validator: Callable[[float | None], None] | None = None,
     ) -> None:
         self.client = client
         self.allowed_slots = None if allowed_slots is None else tuple(allowed_slots)
@@ -308,6 +313,7 @@ class Pa2Controller:
         self.post_recall_delay = validated["post_recall_delay"]
         self._sleep = sleep
         self._monotonic = monotonic
+        self._reconnect_validator = reconnect_validator
         self._lock = threading.RLock()
         self._active_recall_deadline: float | None = None
 
@@ -444,7 +450,11 @@ class Pa2Controller:
                     identity=identity,
                     first_write_deadline=admission_deadline,
                 )
-            except ProtocolStartDeadlineExpired:
+            except ConnectionValidationError:
+                # The client may now be connected to a different physical unit.
+                # Do not issue rollback writes through that untrusted session.
+                raise
+            except (ProtocolStartDeadlineExpired, ConnectionValidationError):
                 raise
             except Exception as error:
                 if not outputs_touched:
@@ -454,6 +464,8 @@ class Pa2Controller:
                         OUTPUT_MUTES,
                         deadline=self._active_recall_deadline,
                     )
+                except ConnectionValidationError:
+                    raise
                 except Exception as rollback_error:
                     if isinstance(rollback_error, RollbackDeadlineError):
                         raise rollback_error from error
@@ -698,7 +710,7 @@ class Pa2Controller:
                         raise OutputVerificationError(
                             "current preset changed during unmute"
                         )
-            except ProtocolStartDeadlineExpired:
+            except (ProtocolStartDeadlineExpired, ConnectionValidationError):
                 raise
             except Exception as error:
                 try:
@@ -707,6 +719,8 @@ class Pa2Controller:
                         deadline=deadline,
                         reconnect_first=True,
                     )
+                except ConnectionValidationError:
+                    raise
                 except Exception as rollback_error:
                     if isinstance(rollback_error, RollbackDeadlineError):
                         raise rollback_error from error
@@ -798,8 +812,10 @@ class Pa2Controller:
     def _client_reconnect(self, *, deadline: float | None) -> None:
         if deadline is not None:
             self.client.reconnect_before(deadline=deadline)
-            return
-        self.client.reconnect()
+        else:
+            self.client.reconnect()
+        if self._reconnect_validator is not None:
+            self._reconnect_validator(deadline)
 
     def _write_all_outputs(
         self,
@@ -880,6 +896,8 @@ class Pa2Controller:
             self._require_rollback_before(deadline, "initial recovery reconnect")
             try:
                 self._client_reconnect(deadline=deadline)
+            except ConnectionValidationError:
+                raise
             except Exception as error:
                 errors.append(f"initial recovery reconnect: {error}")
             self._require_rollback_before(deadline, "starting recovery writes")
@@ -896,6 +914,8 @@ class Pa2Controller:
                     self._require_rollback_before(deadline, "reconnecting")
                     try:
                         self._client_reconnect(deadline=deadline)
+                    except ConnectionValidationError:
+                        raise
                     except Exception as reconnect_error:
                         errors.append(f"reconnect failed: {reconnect_error}")
                     self._require_rollback_before(deadline, "continuing after reconnect")
@@ -913,6 +933,8 @@ class Pa2Controller:
                     self._require_rollback_before(deadline, "reconnecting")
                     try:
                         self._client_reconnect(deadline=deadline)
+                    except ConnectionValidationError:
+                        raise
                     except Exception as reconnect_error:
                         errors.append(f"reconnect failed: {reconnect_error}")
                     self._require_rollback_before(deadline, "continuing after reconnect")
@@ -939,6 +961,8 @@ class Pa2Controller:
                 self._require_rollback_before(deadline, "reconnecting")
                 try:
                     self._client_reconnect(deadline=deadline)
+                except ConnectionValidationError:
+                    raise
                 except Exception as reconnect_error:
                     errors.append(f"reconnect failed: {reconnect_error}")
                 self._require_rollback_before(deadline, "continuing after reconnect")
@@ -1020,7 +1044,7 @@ class Pa2Controller:
                             "current preset changed during unmute"
                         )
                 return readback
-            except ProtocolStartDeadlineExpired:
+            except (ProtocolStartDeadlineExpired, ConnectionValidationError):
                 raise
             except Exception as error:
                 try:
@@ -1029,6 +1053,8 @@ class Pa2Controller:
                         deadline=deadline,
                         reconnect_first=True,
                     )
+                except ConnectionValidationError:
+                    raise
                 except Exception as rollback_error:
                     if isinstance(rollback_error, RollbackDeadlineError):
                         raise rollback_error from error

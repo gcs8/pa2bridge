@@ -3,19 +3,24 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import logging
 import os
 import re
 import signal
+import socket
 import stat
 import tempfile
 import threading
 import time
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from queue import Empty, Full, Queue
 from typing import Any
+from urllib.error import URLError
+from urllib.request import Request, urlopen
 
 import paho.mqtt.client as mqtt
 
@@ -23,9 +28,12 @@ from .config import (
     MQTT_KEEPALIVE_SECONDS,
     AppConfig,
     ConfigError,
+    normalize_mac_address,
     validate_mqtt_topic_prefix,
+    validate_network_host,
 )
 from .controller import (
+    ConnectionValidationError,
     DeviceIdentity,
     INPUT_CLIPS,
     INPUT_LEVELS,
@@ -46,6 +54,15 @@ DETAIL_REFRESH_INTERVAL = 60.0
 SHUTDOWN_PUBLISH_TIMEOUT = 5.0
 _MAX_DISCOVERY_STATE_BYTES = 64 * 1024
 _MAX_DISCOVERY_TOPICS = 100
+_MAX_IDENTITY_STATE_BYTES = 1024
+_MAX_ARP_TABLE_BYTES = 64 * 1024
+_MAX_HA_STATES_BYTES = 16 * 1024 * 1024
+_MAX_HA_TEMPLATE_BYTES = 64 * 1024
+_MAX_HA_CONFIG_ENTRIES_BYTES = 2 * 1024 * 1024
+_MAX_HA_TRACKER_CANDIDATES = 32
+_MAX_TRACKER_AGE_SECONDS = 2 * 60 * 60
+_TRUSTED_NETWORK_INTEGRATIONS = frozenset({"unifi", "unifi_insights"})
+_HA_TRACKER_ENTITY_ID = re.compile(r"device_tracker\.[a-z0-9_]{1,255}", re.ASCII)
 _DISCOVERY_NODE = re.compile(r"driverack_pa2_[A-Za-z0-9_-]{1,253}", re.ASCII)
 _DISCOVERY_OBJECTS = frozenset(
     {
@@ -65,6 +82,267 @@ COMMAND_TTL_SECONDS = 5.0
 PA2_READ_CYCLE_TIMEOUT = 60.0
 
 
+def _resolve_ipv4_addresses(host: str) -> set[str]:
+    try:
+        address = ipaddress.ip_address(host)
+        return {str(address)} if address.version == 4 else set()
+    except ValueError:
+        try:
+            addresses = {
+                str(result[4][0])
+                for result in socket.getaddrinfo(
+                    host,
+                    None,
+                    family=socket.AF_INET,
+                    type=socket.SOCK_STREAM,
+                )
+            }
+            return addresses if len(addresses) == 1 else set()
+        except OSError:
+            return set()
+
+
+def _discover_mac_address(
+    host: str,
+    *,
+    arp_path: Path = Path("/proc/net/arp"),
+) -> str | None:
+    """Read the connected IPv4 peer's complete entry from the local ARP table."""
+
+    addresses = _resolve_ipv4_addresses(host)
+    if not addresses:
+        return None
+    try:
+        with arp_path.open("rb") as handle:
+            raw = handle.read(_MAX_ARP_TABLE_BYTES + 1)
+    except OSError:
+        return None
+    if len(raw) > _MAX_ARP_TABLE_BYTES:
+        return None
+    try:
+        lines = raw.decode("ascii").splitlines()[1:]
+    except UnicodeDecodeError:
+        return None
+    matches: set[str] = set()
+    for line in lines:
+        fields = line.split()
+        if len(fields) < 6 or fields[0] not in addresses:
+            continue
+        try:
+            flags = int(fields[2], 16)
+            mac_address = normalize_mac_address(
+                fields[3],
+                description="neighbor MAC address",
+            )
+        except (ConfigError, ValueError):
+            continue
+        if fields[1] == "0x1" and flags >= 0 and flags & 0x2 and mac_address is not None:
+            matches.add(mac_address)
+    if len(matches) > 1:
+        raise DiscoveryStateError("local neighbour table has conflicting PA2 MAC entries")
+    if not matches:
+        return None
+    return matches.pop()
+
+
+def _remaining_ha_timeout(deadline: float, limit: float) -> float | None:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return None
+    return min(limit, remaining)
+
+
+def _discover_mac_address_from_home_assistant(
+    host: str,
+    token: str,
+    *,
+    timeout: float = 3.0,
+    deadline: float | None = None,
+) -> str | None:
+    """Correlate an IPv4 peer with network-integration state held by Home Assistant."""
+
+    addresses = _resolve_ipv4_addresses(host)
+    if not addresses or not token:
+        return None
+    if deadline is None:
+        deadline = time.monotonic() + timeout
+    request_timeout = _remaining_ha_timeout(deadline, timeout)
+    if request_timeout is None:
+        return None
+    try:
+        request = Request(
+            "http://supervisor/core/api/states",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        with urlopen(request, timeout=request_timeout) as response:
+            raw = response.read(_MAX_HA_STATES_BYTES + 1)
+    except (OSError, URLError, ValueError):
+        return None
+    if len(raw) > _MAX_HA_STATES_BYTES:
+        return None
+    try:
+        states = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(states, list):
+        return None
+    candidates: dict[str, set[str]] = {}
+    for state in states:
+        if not isinstance(state, dict):
+            continue
+        entity_id = state.get("entity_id")
+        if (
+            not isinstance(entity_id, str)
+            or _HA_TRACKER_ENTITY_ID.fullmatch(entity_id) is None
+            or state.get("state") != "home"
+        ):
+            continue
+        timestamp = state.get("last_reported", state.get("last_updated"))
+        if not isinstance(timestamp, str):
+            continue
+        try:
+            observed_at = datetime.fromisoformat(timestamp)
+        except ValueError:
+            continue
+        if observed_at.tzinfo is None:
+            continue
+        try:
+            age = (datetime.now(UTC) - observed_at.astimezone(UTC)).total_seconds()
+        except (OverflowError, ValueError):
+            continue
+        if age < -300 or age > _MAX_TRACKER_AGE_SECONDS:
+            continue
+        attributes = state.get("attributes")
+        if (
+            not isinstance(attributes, dict)
+            or attributes.get("source_type") != "router"
+            or attributes.get("tracking_type") != "connection"
+            or attributes.get("authorized") is not True
+        ):
+            continue
+        observed_ips: set[str] = set()
+        for key in ("ip", "ip_address", "ip_addresses"):
+            value = attributes.get(key)
+            values = value if isinstance(value, list) else [value]
+            for candidate in values:
+                if not isinstance(candidate, str):
+                    continue
+                try:
+                    parsed = ipaddress.ip_address(candidate)
+                except ValueError:
+                    continue
+                if parsed.version == 4:
+                    observed_ips.add(str(parsed))
+        if not addresses.intersection(observed_ips):
+            continue
+        for key in ("mac", "mac_address"):
+            try:
+                mac_address = normalize_mac_address(
+                    attributes.get(key),
+                    description="Home Assistant network MAC address",
+                )
+            except ConfigError:
+                continue
+            if mac_address is not None:
+                candidates.setdefault(entity_id, set()).add(mac_address)
+    trusted = _trusted_home_assistant_trackers(
+        frozenset(candidates),
+        token,
+        timeout=timeout,
+        deadline=deadline,
+    )
+    matches = {
+        mac_address
+        for entity_id in trusted
+        for mac_address in candidates[entity_id]
+    }
+    if len(matches) > 1:
+        raise DiscoveryStateError(
+            "Home Assistant network data has conflicting PA2 MAC entries"
+        )
+    if not matches:
+        return None
+    return matches.pop()
+
+
+def _trusted_home_assistant_trackers(
+    entity_ids: frozenset[str],
+    token: str,
+    *,
+    timeout: float = 3.0,
+    deadline: float | None = None,
+) -> frozenset[str]:
+    """Verify candidate tracker ownership through Home Assistant's registry data."""
+
+    if not entity_ids or len(entity_ids) > _MAX_HA_TRACKER_CANDIDATES:
+        return frozenset()
+    if deadline is None:
+        deadline = time.monotonic() + timeout
+    mapping_items = ",".join(
+        f"{json.dumps(entity_id)}:config_entry_id({json.dumps(entity_id)})"
+        for entity_id in sorted(entity_ids)
+    )
+    template = "{{ {" + mapping_items + "} | to_json }}"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+    try:
+        request_timeout = _remaining_ha_timeout(deadline, timeout)
+        if request_timeout is None:
+            return frozenset()
+        request = Request(
+            "http://supervisor/core/api/template",
+            data=json.dumps({"template": template}).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
+        with urlopen(request, timeout=request_timeout) as response:
+            raw_mapping = response.read(_MAX_HA_TEMPLATE_BYTES + 1)
+        request_timeout = _remaining_ha_timeout(deadline, timeout)
+        if request_timeout is None:
+            return frozenset()
+        request = Request(
+            "http://supervisor/core/api/config/config_entries/entry",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        with urlopen(request, timeout=request_timeout) as response:
+            raw_entries = response.read(_MAX_HA_CONFIG_ENTRIES_BYTES + 1)
+    except (OSError, URLError, ValueError):
+        return frozenset()
+    if (
+        len(raw_mapping) > _MAX_HA_TEMPLATE_BYTES
+        or len(raw_entries) > _MAX_HA_CONFIG_ENTRIES_BYTES
+    ):
+        return frozenset()
+    try:
+        mapping = json.loads(
+            raw_mapping.decode("utf-8"),
+            object_pairs_hook=_reject_duplicate_json_keys,
+        )
+        entries = json.loads(
+            raw_entries.decode("utf-8"),
+            object_pairs_hook=_reject_duplicate_json_keys,
+        )
+    except (DiscoveryStateError, UnicodeDecodeError, json.JSONDecodeError):
+        return frozenset()
+    if not isinstance(mapping, dict) or not isinstance(entries, list):
+        return frozenset()
+    trusted_entries = {
+        entry.get("entry_id")
+        for entry in entries
+        if isinstance(entry, dict)
+        and entry.get("domain") in _TRUSTED_NETWORK_INTEGRATIONS
+        and isinstance(entry.get("entry_id"), str)
+    }
+    return frozenset(
+        entity_id
+        for entity_id in entity_ids
+        if isinstance(mapping.get(entity_id), str)
+        and mapping[entity_id] in trusted_entries
+    )
+
+
 class MqttPublishError(RuntimeError):
     """The broker did not accept a required state or availability update."""
 
@@ -73,11 +351,15 @@ class DiscoveryStateError(RuntimeError):
     """Persisted MQTT discovery ownership state was missing or unsafe."""
 
 
+class IdentityRevalidationUnavailable(RuntimeError):
+    """Live network data could not temporarily confirm the saved PA2 identity."""
+
+
 def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for key, value in pairs:
         if key in result:
-            raise DiscoveryStateError(f"duplicate discovery state key: {key}")
+            raise DiscoveryStateError(f"duplicate state key: {key}")
         result[key] = value
     return result
 
@@ -137,6 +419,65 @@ def _load_discovery_topics(path: Path | None) -> frozenset[str]:
     if len(set(validated)) != len(validated):
         raise DiscoveryStateError("discovery state contains duplicate topics")
     return frozenset(validated)
+
+
+def _load_identity_state(path: Path | None) -> tuple[str, str] | None:
+    if path is None:
+        return None
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(metadata.st_mode) & 0o077
+        ):
+            raise DiscoveryStateError("identity state file has unsafe ownership or mode")
+        with os.fdopen(descriptor, "rb") as handle:
+            descriptor = None
+            raw = handle.read(_MAX_IDENTITY_STATE_BYTES + 1)
+    except FileNotFoundError:
+        return None
+    except DiscoveryStateError:
+        raise
+    except OSError as error:
+        raise DiscoveryStateError(f"could not read identity state: {error}") from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    if len(raw) > _MAX_IDENTITY_STATE_BYTES:
+        raise DiscoveryStateError("identity state exceeds its size limit")
+    try:
+        value = json.loads(
+            raw.decode("utf-8"), object_pairs_hook=_reject_duplicate_json_keys
+        )
+    except DiscoveryStateError:
+        raise
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise DiscoveryStateError(f"could not parse identity state: {error}") from error
+    if not isinstance(value, dict) or set(value) != {"version", "host", "mac_address"}:
+        raise DiscoveryStateError("identity state has an invalid schema")
+    if type(value["version"]) is not int or value["version"] != 1:
+        raise DiscoveryStateError("identity state has an unsupported version")
+    try:
+        host = _normalize_identity_host(value["host"])
+        mac_address = normalize_mac_address(
+            value["mac_address"], description="persisted PA2 MAC address"
+        )
+    except (ConfigError, ValueError, TypeError) as error:
+        raise DiscoveryStateError("identity state has invalid values") from error
+    if mac_address is None:
+        raise DiscoveryStateError("identity state has invalid values")
+    return host, mac_address
+
+
+def _normalize_identity_host(value: Any) -> str:
+    host = validate_network_host(value, description="persisted PA2 host")
+    try:
+        return str(ipaddress.ip_address(host))
+    except ValueError:
+        return host.lower()
 
 
 def _fsync_directory(path: Path) -> None:
@@ -250,22 +591,7 @@ def _create_state_directory(directory: Path) -> None:
     inner_marker.unlink()
 
 
-def _save_discovery_topics(path: Path, topics: frozenset[str]) -> None:
-    if len(topics) > _MAX_DISCOVERY_TOPICS:
-        raise DiscoveryStateError("discovery state has too many owned topics")
-    validated_topics = frozenset(
-        _validate_discovery_topic(topic) for topic in topics
-    )
-    payload = (
-        json.dumps(
-            {"version": 1, "topics": sorted(validated_topics)},
-            separators=(",", ":"),
-            sort_keys=True,
-        )
-        + "\n"
-    ).encode("utf-8")
-    if len(payload) > _MAX_DISCOVERY_STATE_BYTES:
-        raise DiscoveryStateError("discovery state exceeds its size limit")
+def _save_state_payload(path: Path, payload: bytes, *, description: str) -> None:
     descriptor: int | None = None
     temporary_path: str | None = None
     write_error: OSError | None = None
@@ -281,7 +607,7 @@ def _save_discovery_topics(path: Path, topics: frozenset[str]) -> None:
         while remaining:
             written = os.write(descriptor, remaining)
             if written <= 0:
-                raise OSError("discovery state write made no progress")
+                raise OSError(f"{description} write made no progress")
             remaining = remaining[written:]
         os.fsync(descriptor)
         os.close(descriptor)
@@ -307,12 +633,58 @@ def _save_discovery_topics(path: Path, topics: frozenset[str]) -> None:
                     cleanup_error = error
     if write_error is not None:
         raise DiscoveryStateError(
-            f"could not write discovery state: {write_error}"
+            f"could not write {description}: {write_error}"
         ) from write_error
     if cleanup_error is not None:
         raise DiscoveryStateError(
-            f"could not clean up discovery state: {cleanup_error}"
+            f"could not clean up {description}: {cleanup_error}"
         ) from cleanup_error
+
+
+def _save_discovery_topics(path: Path, topics: frozenset[str]) -> None:
+    if len(topics) > _MAX_DISCOVERY_TOPICS:
+        raise DiscoveryStateError("discovery state has too many owned topics")
+    validated_topics = frozenset(
+        _validate_discovery_topic(topic) for topic in topics
+    )
+    payload = (
+        json.dumps(
+            {"version": 1, "topics": sorted(validated_topics)},
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        + "\n"
+    ).encode("utf-8")
+    if len(payload) > _MAX_DISCOVERY_STATE_BYTES:
+        raise DiscoveryStateError("discovery state exceeds its size limit")
+    _save_state_payload(path, payload, description="discovery state")
+
+
+def _save_identity_state(path: Path, host: str, mac_address: str) -> None:
+    try:
+        normalized_host = _normalize_identity_host(host)
+        normalized_mac = normalize_mac_address(
+            mac_address, description="persisted PA2 MAC address"
+        )
+    except (ConfigError, ValueError, TypeError) as error:
+        raise DiscoveryStateError("identity state has invalid values") from error
+    if normalized_mac is None:
+        raise DiscoveryStateError("identity state has invalid values")
+    payload = (
+        json.dumps(
+            {
+                "version": 1,
+                "host": normalized_host,
+                "mac_address": normalized_mac,
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        + "\n"
+    ).encode("utf-8")
+    if len(payload) > _MAX_IDENTITY_STATE_BYTES:
+        raise DiscoveryStateError("identity state exceeds its size limit")
+    _save_state_payload(path, payload, description="identity state")
 
 
 @dataclass(frozen=True)
@@ -320,6 +692,7 @@ class DeviceInfo:
     identifier: str
     name: str
     firmware: str
+    mac_address: str | None = None
 
 
 @dataclass(frozen=True)
@@ -338,13 +711,16 @@ class QueuedCommand:
 
 
 def _device_payload(device: DeviceInfo) -> dict[str, Any]:
-    return {
+    payload: dict[str, Any] = {
         "identifiers": [device.identifier],
         "name": device.name,
         "manufacturer": "dbx",
         "model": "DriveRack PA2",
         "sw_version": device.firmware,
     }
+    if device.mac_address is not None:
+        payload["connections"] = [["mac", device.mac_address]]
+    return payload
 
 
 def build_discovery_messages(
@@ -565,12 +941,22 @@ class MqttBridge:
         config: AppConfig,
         *,
         discovery_state_path: Path | None = None,
+        home_assistant_token: str | None = None,
     ) -> None:
         self.config = config
         self.discovery_state_path = discovery_state_path
+        self.identity_state_path = (
+            discovery_state_path.with_name("identity.json")
+            if discovery_state_path is not None
+            else None
+        )
+        self._home_assistant_token = home_assistant_token
         self._persisted_discovery_topics = _load_discovery_topics(
             discovery_state_path
         )
+        self._persisted_identity = _load_identity_state(self.identity_state_path)
+        self._pending_identity_state: tuple[str, str] | None = None
+        self._stable_mac_address = config.pa2.mac_address
         self.pa2_client = HiQnetClient(
             config.pa2.host,
             port=config.pa2.port,
@@ -582,6 +968,7 @@ class MqttBridge:
             recall_timeout=config.pa2.recall_timeout,
             poll_interval=config.pa2.poll_interval,
             post_recall_delay=config.pa2.post_recall_delay,
+            reconnect_validator=self._validate_reconnected_peer,
         )
         self.mqtt = mqtt.Client(
             callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
@@ -719,6 +1106,7 @@ class MqttBridge:
                     self._apply_pending_sigterm()
                     reconnect_delay = 1.0
                 except (
+                    IdentityRevalidationUnavailable,
                     ProtocolError,
                     OSError,
                     ValueError,
@@ -728,7 +1116,14 @@ class MqttBridge:
                 ) as error:
                     if self._apply_pending_sigterm():
                         continue
-                    LOGGER.warning("PA2 poll failed: %s", error)
+                    if isinstance(error, IdentityRevalidationUnavailable):
+                        LOGGER.warning(
+                            "PA2 identity could not be confirmed from current network data; "
+                            "retrying safely. Check UniFi tracking or enter the optional PA2 "
+                            "MAC address if this continues."
+                        )
+                    else:
+                        LOGGER.warning("PA2 poll failed: %s", error)
                     self._stop_event.wait(timeout=reconnect_delay)
                     reconnect_delay = min(reconnect_delay * 2, 30.0)
         except KeyboardInterrupt:
@@ -999,7 +1394,7 @@ class MqttBridge:
             presets = self.controller.list_presets(deadline=deadline)
             self._allowed_presets = tuple(presets)
             self._preset_commands = frozenset(preset.label for preset in presets)
-            self.device = self._device_info(identity)
+            self.device = self._device_info(identity, deadline=deadline)
             self.discovery = build_discovery_messages(
                 device=self.device,
                 presets=presets,
@@ -1010,14 +1405,155 @@ class MqttBridge:
             self._discovery_published = False
             self._discovery_needs_refresh = False
             self._details_valid = False
+            LOGGER.info(
+                "connected to PA2 %r at %s:%d (firmware %r); %d presets available",
+                identity.instance_name,
+                self.config.pa2.host,
+                self.config.pa2.port,
+                identity.firmware,
+                len(presets),
+            )
 
-    def _device_info(self, identity: DeviceIdentity) -> DeviceInfo:
-        safe_host = self.config.pa2.host.replace(".", "_").replace(":", "_")
+    def _device_info(
+        self,
+        identity: DeviceIdentity,
+        *,
+        deadline: float | None = None,
+    ) -> DeviceInfo:
+        configured_mac = self.config.pa2.mac_address
+        persisted_mac = (
+            self._persisted_identity[1]
+            if self._persisted_identity is not None
+            else None
+        )
+        peer_ipv4 = getattr(self.pa2_client, "peer_ipv4", None)
+        discovered: str | None = None
+        source: str | None = None
+        if deadline is not None and time.monotonic() >= deadline:
+            raise DiscoveryStateError("PA2 peer validation deadline expired")
+        if peer_ipv4 is not None:
+            discovered = _discover_mac_address(peer_ipv4)
+            source = "local network"
+        if (
+            peer_ipv4 is not None
+            and discovered is None
+            and self._home_assistant_token is not None
+        ):
+            timeout = 3.0
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise DiscoveryStateError("PA2 peer validation deadline expired")
+                timeout = min(timeout, remaining)
+            discovered = _discover_mac_address_from_home_assistant(
+                peer_ipv4,
+                self._home_assistant_token,
+                timeout=timeout,
+                deadline=deadline,
+            )
+            source = "Home Assistant network data"
+
+        if configured_mac is not None:
+            if discovered is not None and configured_mac != discovered:
+                raise DiscoveryStateError(
+                    "configured PA2 MAC conflicts with the connected peer"
+                )
+            if (
+                persisted_mac is not None
+                and configured_mac != persisted_mac
+                and not self.config.pa2.replace_saved_identity
+            ):
+                raise DiscoveryStateError(
+                    "configured PA2 MAC conflicts with persisted identity state"
+                )
+            if persisted_mac is not None and configured_mac != persisted_mac:
+                LOGGER.warning(
+                    "replacing the saved PA2 identity after explicit operator request"
+                )
+            mac_address = configured_mac
+        elif discovered is not None:
+            if (
+                self._stable_mac_address is not None
+                and discovered != self._stable_mac_address
+            ):
+                raise DiscoveryStateError(
+                    "discovered PA2 MAC conflicts with the active stable identity"
+                )
+            if persisted_mac is not None and discovered != persisted_mac:
+                raise DiscoveryStateError(
+                    "discovered PA2 MAC conflicts with persisted identity state"
+                )
+            newly_discovered = self._stable_mac_address is None
+            mac_address = discovered
+            self._stable_mac_address = discovered
+            if newly_discovered:
+                LOGGER.info(
+                    "discovered PA2 MAC from %s for stable MQTT identity",
+                    source,
+                )
+        elif self._stable_mac_address is not None or persisted_mac is not None:
+            raise IdentityRevalidationUnavailable(
+                "the connected PA2 peer MAC could not be revalidated"
+            )
+        else:
+            mac_address = None
+            LOGGER.warning(
+                "PA2 MAC was not found for %s; using address-based MQTT identity. "
+                "Commands that require an internal reconnect will be refused until a "
+                "stable MAC is available; check UniFi tracking or enter the optional "
+                "PA2 MAC address.",
+                self.config.pa2.host,
+            )
+
+        if mac_address is not None and self.identity_state_path is not None:
+            persisted_host = peer_ipv4 or self.config.pa2.host
+            persisted_value = (
+                _normalize_identity_host(persisted_host),
+                mac_address,
+            )
+            if self._persisted_identity != persisted_value:
+                replacing_physical_device = (
+                    persisted_mac is not None
+                    and persisted_mac != mac_address
+                    and self.config.pa2.replace_saved_identity
+                )
+                if replacing_physical_device:
+                    self._pending_identity_state = (persisted_host, mac_address)
+                else:
+                    _save_identity_state(
+                        self.identity_state_path,
+                        persisted_host,
+                        mac_address,
+                    )
+                    self._persisted_identity = persisted_value
+        if mac_address is None:
+            stable_id = self.config.pa2.host.replace(".", "_").replace(":", "_")
+        else:
+            stable_id = mac_address.replace(":", "")
         return DeviceInfo(
-            identifier=f"driverack_pa2_{safe_host}",
+            identifier=f"driverack_pa2_{stable_id}",
             name=identity.instance_name,
             firmware=identity.firmware,
+            mac_address=mac_address,
         )
+
+    def _validate_reconnected_peer(self, deadline: float | None) -> None:
+        cached = self._pa2_identity
+        identity = (
+            cached[1]
+            if cached is not None
+            else DeviceIdentity("dbxDriveRackPA2", "DriveRackPA2", "unknown")
+        )
+        try:
+            device = self._device_info(identity, deadline=deadline)
+            if device.mac_address is None:
+                raise DiscoveryStateError(
+                    "PA2 reconnect cannot continue without a stable MAC identity"
+                )
+            if deadline is not None and time.monotonic() >= deadline:
+                raise DiscoveryStateError("PA2 peer validation deadline expired")
+        except (DiscoveryStateError, IdentityRevalidationUnavailable) as error:
+            raise ConnectionValidationError(str(error)) from error
 
     def _identity_for_connection(
         self,
@@ -1031,7 +1567,7 @@ class MqttBridge:
         if cached is None or cached[0] != generation:
             identity = self.controller.identity(deadline=deadline)
             self._pa2_identity = (generation, identity)
-            self.device = self._device_info(identity)
+            self.device = self._device_info(identity, deadline=deadline)
             self.discovery = build_discovery_messages(
                 device=self.device,
                 presets=list(self._allowed_presets),
@@ -1107,6 +1643,7 @@ class MqttBridge:
                 self._stop_event.set()
             else:
                 self._mqtt_connected = True
+                LOGGER.info("connected to MQTT broker; command subscription ready")
             self._pending_subscribe_mid = None
             self._mqtt_ready.set()
             self._mqtt_state_changed.set()
@@ -1329,7 +1866,13 @@ class MqttBridge:
                 except Exception as error:
                     if self._apply_pending_sigterm():
                         return
-                    LOGGER.error("command failed (%s)", type(error).__name__)
+                    if isinstance(error, ConnectionValidationError):
+                        LOGGER.error(
+                            "command stopped because the reconnected PA2 identity "
+                            "could not be verified; no writes were sent after reconnect"
+                        )
+                    else:
+                        LOGGER.error("command failed (%s)", type(error).__name__)
                     if device_touched:
                         try:
                             self.pa2_client.close()
@@ -1344,9 +1887,15 @@ class MqttBridge:
                         self._publish(
                             f"{base}/status", "offline", retain=True
                         )
+                    user_result = "ERROR: command failed"
+                    if isinstance(error, ConnectionValidationError):
+                        user_result = (
+                            "ERROR: PA2 identity could not be verified; check network "
+                            "tracking or the optional MAC setting"
+                        )
                     self._publish(
                         f"{base}/state/last_command",
-                        "ERROR: command failed",
+                        user_result,
                         retain=True,
                     )
 
@@ -1398,12 +1947,34 @@ class MqttBridge:
             for message in validated_messages
         ]
         self._wait_for_discovery_publications(current_results, deadline=deadline)
+        if self._pending_identity_state is not None:
+            pending_host, pending_mac = self._pending_identity_state
+            if self.identity_state_path is None:
+                raise DiscoveryStateError(
+                    "replacement identity state has no durable destination"
+                )
+            _save_identity_state(
+                self.identity_state_path,
+                pending_host,
+                pending_mac,
+            )
+            self._persisted_identity = (
+                _normalize_identity_host(pending_host),
+                pending_mac,
+            )
+            self._pending_identity_state = None
         if (
             self.discovery_state_path is not None
             and current_topics != self._persisted_discovery_topics
         ):
             _save_discovery_topics(self.discovery_state_path, current_topics)
         self._persisted_discovery_topics = current_topics
+        LOGGER.info(
+            "published MQTT discovery for %r: %d entities, %d stale topics removed",
+            self.device.name if self.device is not None else "PA2",
+            len(current_topics),
+            len(stale_topics),
+        )
 
     def _wait_for_discovery_publications(
         self,
