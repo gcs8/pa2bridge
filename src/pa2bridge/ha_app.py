@@ -318,6 +318,7 @@ def main(argv: list[str] | None = None) -> int:
         MqttBridge(
             load_ha_app_config(args.options, environ=os.environ),
             discovery_state_path=Path("/data/discovery.json"),
+            identity_state_path=Path("/data/identity.json"),
             home_assistant_token=_supervisor_token(os.environ),
         ).run_forever()
         return 0

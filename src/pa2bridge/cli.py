@@ -101,7 +101,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--discovery-state",
         type=Path,
         default=state_home / "pa2bridge/discovery.json",
-        help="durable MQTT discovery topic state",
+        help="durable MQTT discovery topic state (identity state uses a named companion)",
     )
     return parser
 

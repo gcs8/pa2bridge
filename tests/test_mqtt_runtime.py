@@ -334,6 +334,55 @@ def make_bridge(
     return bridge, fake_mqtt, fake_pa2, controller
 
 
+def test_custom_discovery_manifests_use_distinct_identity_state_files(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    first, _, _, _ = make_bridge(
+        monkeypatch,
+        discovery_state_path=tmp_path / "pa2-a.json",
+    )
+    second, _, _, _ = make_bridge(
+        monkeypatch,
+        discovery_state_path=tmp_path / "pa2-b.json",
+    )
+
+    assert first.identity_state_path == tmp_path / "pa2-a.identity.json"
+    assert second.identity_state_path == tmp_path / "pa2-b.identity.json"
+
+
+def test_identity_named_discovery_manifest_does_not_share_its_state_path(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    discovery_path = tmp_path / "identity.json"
+    bridge, _, _, _ = make_bridge(
+        monkeypatch,
+        discovery_state_path=discovery_path,
+    )
+
+    assert bridge.identity_state_path == tmp_path / "identity.identity.json"
+    assert bridge.identity_state_path != discovery_path
+
+
+def test_explicit_identity_state_cannot_alias_discovery_manifest(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr("pa2bridge.mqtt_bridge.mqtt.Client", FakeMqttClient)
+    state_path = tmp_path / "state.json"
+
+    with pytest.raises(
+        DiscoveryStateError,
+        match="discovery and identity state paths must be different",
+    ):
+        MqttBridge(
+            make_config(),
+            discovery_state_path=state_path,
+            identity_state_path=tmp_path / "nested" / ".." / "state.json",
+        )
+
+
 def message(topic: str, payload: str, *, retain: bool = False):
     return SimpleNamespace(topic=topic, payload=payload.encode(), retain=retain)
 
@@ -688,7 +737,7 @@ def test_persisted_mac_identity_fails_closed_on_restart_lookup_failure(
         lambda host: "02:00:5e:10:00:01",
     )
     first._connect_pa2()
-    identity_state = state_path.with_name("identity.json")
+    identity_state = state_path.with_name("discovery-state.identity.json")
     assert json.loads(identity_state.read_text(encoding="utf-8")) == {
         "version": 1,
         "host": "192.0.2.20",
@@ -770,7 +819,7 @@ def test_explicit_replacement_updates_persisted_identity(monkeypatch, tmp_path: 
     )
     first._connect_pa2()
     first._publish_discovery(first.discovery)
-    identity_path = state_path.with_name("identity.json")
+    identity_path = state_path.with_name("discovery-state.identity.json")
 
     second, _, _, _ = make_bridge(
         monkeypatch,

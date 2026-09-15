@@ -1023,15 +1023,26 @@ class MqttBridge:
         config: AppConfig,
         *,
         discovery_state_path: Path | None = None,
+        identity_state_path: Path | None = None,
         home_assistant_token: str | None = None,
     ) -> None:
         self.config = config
         self.discovery_state_path = discovery_state_path
-        self.identity_state_path = (
-            discovery_state_path.with_name("identity.json")
-            if discovery_state_path is not None
-            else None
-        )
+        if identity_state_path is None and discovery_state_path is not None:
+            suffix = discovery_state_path.suffix
+            identity_state_path = discovery_state_path.with_name(
+                f"{discovery_state_path.stem}.identity{suffix or '.json'}"
+            )
+        if (
+            discovery_state_path is not None
+            and identity_state_path is not None
+            and os.path.abspath(discovery_state_path)
+            == os.path.abspath(identity_state_path)
+        ):
+            raise DiscoveryStateError(
+                "discovery and identity state paths must be different"
+            )
+        self.identity_state_path = identity_state_path
         self._home_assistant_token = home_assistant_token
         self._persisted_discovery_topics = _load_discovery_topics(
             discovery_state_path

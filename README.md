@@ -167,6 +167,8 @@ pa2bridge --config ~/.config/pa2bridge/config.toml mute
 pa2bridge --config ~/.config/pa2bridge/config.toml daemon
 ```
 
+For standalone daemons, each `--discovery-state PATH` gets a distinct companion identity file named `<stem>.identity<suffix>` in the same directory. For example, `pa2-a.json` uses `pa2-a.identity.json`. Use a different discovery manifest for every PA2 instance.
+
 A failed command exits nonzero and prints `{"verified": false, ...}` to stderr. A successful write is not reported until readback succeeds.
 
 ## Run as a standalone user service

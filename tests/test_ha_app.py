@@ -89,7 +89,7 @@ def test_main_uses_durable_app_discovery_state(monkeypatch, tmp_path: Path) -> N
     _write_options(path, _options())
     for key, value in MQTT_ENV.items():
         monkeypatch.setenv(key, value)
-    calls: list[tuple[Path, str | None]] = []
+    calls: list[tuple[Path, Path, str | None]] = []
 
     class FakeBridge:
         def __init__(
@@ -97,10 +97,13 @@ def test_main_uses_durable_app_discovery_state(monkeypatch, tmp_path: Path) -> N
             config,
             *,
             discovery_state_path: Path,
+            identity_state_path: Path,
             home_assistant_token: str | None,
         ) -> None:
             del config
-            calls.append((discovery_state_path, home_assistant_token))
+            calls.append(
+                (discovery_state_path, identity_state_path, home_assistant_token)
+            )
 
         def run_forever(self) -> None:
             pass
@@ -108,7 +111,13 @@ def test_main_uses_durable_app_discovery_state(monkeypatch, tmp_path: Path) -> N
     monkeypatch.setattr(ha_app, "MqttBridge", FakeBridge)
 
     assert ha_app.main(["--options", str(path)]) == 0
-    assert calls == [(Path("/data/discovery.json"), "synthetic-supervisor-token")]
+    assert calls == [
+        (
+            Path("/data/discovery.json"),
+            Path("/data/identity.json"),
+            "synthetic-supervisor-token",
+        )
+    ]
 
 
 @pytest.mark.parametrize(
@@ -153,9 +162,10 @@ def test_main_reports_mqtt_publish_error_without_traceback(
             config,
             *,
             discovery_state_path: Path,
+            identity_state_path: Path,
             home_assistant_token: str | None,
         ) -> None:
-            del config, discovery_state_path, home_assistant_token
+            del config, discovery_state_path, identity_state_path, home_assistant_token
 
         def run_forever(self) -> None:
             raise ha_app.MqttPublishError("broker rejected discovery")
