@@ -221,15 +221,25 @@ class FakeController:
             clips={"left": False, "right": True},
         )
 
-    def activate_preset(self, payload, *, unmute_after, identity=None):
+    def activate_preset(
+        self,
+        target,
+        *,
+        unmute_after,
+        identity=None,
+        start_deadline=None,
+    ):
+        del start_deadline
         del identity
-        self.activations.append((payload, unmute_after))
+        self.activations.append((target, unmute_after))
         return self.state_value
 
-    def set_all_outputs_muted(self, muted):
+    def set_all_outputs_muted(self, muted, *, start_deadline=None):
+        del start_deadline
         self.all_mutes.append(muted)
 
-    def set_output_muted(self, channel, muted):
+    def set_output_muted(self, channel, muted, *, start_deadline=None):
+        del start_deadline
         self.channel_mutes.append((channel, muted))
 
 
@@ -377,8 +387,10 @@ def test_recall_reconnect_refreshes_identity_before_publishing_state(monkeypatch
     bridge._connect_pa2()
     bridge._discovery_published = True
 
-    def reconnecting_activation(payload, *, unmute_after, identity=None):
-        del payload, unmute_after, identity
+    def reconnecting_activation(
+        payload, *, unmute_after, identity=None, start_deadline=None
+    ):
+        del payload, unmute_after, identity, start_deadline
         pa2.connection_generation += 1
         controller.identity_value = DeviceIdentity(
             "dbxDriveRackPA2", "DriveRackPA2", "1.2.0.2"
@@ -547,7 +559,8 @@ def test_disconnect_after_final_session_check_prevents_command_actuation(monkeyp
     events: list[str] = []
     original_unmute = controller.set_all_outputs_muted
 
-    def record_unmute(muted: bool):
+    def record_unmute(muted: bool, *, start_deadline=None):
+        del start_deadline
         events.append("controller")
         return original_unmute(muted)
 
@@ -764,6 +777,243 @@ def test_disconnect_invalidates_sessions_and_waits_for_fresh_subscription(monkey
     assert bridge._mqtt_connected is True
     bridge._publish("driverack/pa2/status", "online", retain=True)
     assert ("driverack/pa2/status", "online", 1, True) in client.published
+
+
+def test_expired_queued_command_is_discarded_without_pa2_access(monkeypatch) -> None:
+    bridge, client, pa2, controller = make_bridge(monkeypatch)
+    now = 100.0
+    monkeypatch.setattr("pa2bridge.mqtt_bridge.time.monotonic", lambda: now)
+    bridge._on_message(
+        None,
+        None,
+        message("driverack/pa2/command/preset", "2: Alternate"),
+    )
+    now = 105.0
+
+    assert bridge._process_queued_command() is True
+
+    assert controller.activations == []
+    assert pa2.closed == 0
+    assert client.published[-1] == (
+        "driverack/pa2/state/last_command",
+        "ERROR: stale command discarded",
+        1,
+        True,
+    )
+
+
+def test_command_age_starts_when_the_mqtt_callback_receives_it(monkeypatch) -> None:
+    bridge, client, pa2, controller = make_bridge(monkeypatch)
+    now = 100.0
+    timestamp_captured = threading.Event()
+
+    def monotonic() -> float:
+        timestamp_captured.set()
+        return now
+
+    monkeypatch.setattr("pa2bridge.mqtt_bridge.time.monotonic", monotonic)
+    bridge._mqtt_state_lock.acquire()
+    callback = threading.Thread(
+        target=bridge._on_message,
+        args=(
+            None,
+            None,
+            message("driverack/pa2/command/preset", "2: Alternate"),
+        ),
+    )
+    callback.start()
+    try:
+        assert timestamp_captured.wait(timeout=1)
+        now = 105.0
+    finally:
+        bridge._mqtt_state_lock.release()
+        callback.join(timeout=2)
+
+    assert callback.is_alive() is False
+    assert bridge._process_queued_command() is True
+    assert controller.activations == []
+    assert pa2.closed == 0
+    assert client.published[-1][1] == "ERROR: stale command discarded"
+
+
+def test_command_expiring_after_dequeue_is_rechecked_before_pa2_access(monkeypatch) -> None:
+    bridge, client, pa2, controller = make_bridge(monkeypatch)
+    now = 100.0
+    precheck_finished = threading.Event()
+    clock_calls = 0
+
+    def monotonic() -> float:
+        nonlocal clock_calls
+        clock_calls += 1
+        if clock_calls >= 2:
+            precheck_finished.set()
+        return now
+
+    monkeypatch.setattr("pa2bridge.mqtt_bridge.time.monotonic", monotonic)
+    bridge._on_message(
+        None,
+        None,
+        message("driverack/pa2/command/preset", "2: Alternate"),
+    )
+    bridge._pa2_lock.acquire()
+    worker = threading.Thread(target=bridge._process_queued_command)
+    worker.start()
+    try:
+        assert precheck_finished.wait(timeout=1)
+        now = 105.0
+    finally:
+        bridge._pa2_lock.release()
+        worker.join(timeout=2)
+
+    assert worker.is_alive() is False
+    assert controller.activations == []
+    assert pa2.closed == 0
+    assert client.published[-1] == (
+        "driverack/pa2/state/last_command",
+        "ERROR: stale command discarded",
+        1,
+        True,
+    )
+
+
+@pytest.mark.parametrize(
+    ("topic", "payload", "operation"),
+    [
+        ("preset", "2: Alternate", "preset"),
+        ("unmute", "PRESS", "all"),
+        ("mute/high_left", "On", "single"),
+    ],
+)
+def test_command_deadline_reaches_the_actuator_transaction_boundary(
+    monkeypatch,
+    topic: str,
+    payload: str,
+    operation: str,
+) -> None:
+    bridge, _, _, controller = make_bridge(monkeypatch)
+    now = 100.0
+    deadlines: list[float] = []
+    identity_deadlines: list[float] = []
+    monkeypatch.setattr("pa2bridge.mqtt_bridge.time.monotonic", lambda: now)
+
+    def identity(*, deadline: float):
+        identity_deadlines.append(deadline)
+        return controller.identity_value
+
+    def activate(target, *, unmute_after, identity, start_deadline: float):
+        del target, unmute_after, identity
+        deadlines.append(start_deadline)
+        return controller.state_value
+
+    def set_all(muted: bool, *, start_deadline: float) -> None:
+        assert muted is False
+        deadlines.append(start_deadline)
+
+    def set_single(channel: str, muted: bool, *, start_deadline: float) -> None:
+        assert (channel, muted) == ("high_left", True)
+        deadlines.append(start_deadline)
+
+    monkeypatch.setattr(controller, "identity", identity)
+    if operation == "preset":
+        monkeypatch.setattr(controller, "activate_preset", activate)
+    elif operation == "all":
+        monkeypatch.setattr(controller, "set_all_outputs_muted", set_all)
+    else:
+        monkeypatch.setattr(controller, "set_output_muted", set_single)
+    bridge._on_message(
+        None,
+        None,
+        message(f"driverack/pa2/command/{topic}", payload),
+    )
+
+    bridge._process_queued_command()
+
+    assert deadlines == [105.0]
+    if operation == "preset":
+        assert identity_deadlines == [105.0]
+
+
+@pytest.mark.parametrize(
+    ("topic", "payload", "operation"),
+    [
+        ("preset", "2: Alternate", "preset"),
+        ("unmute", "PRESS", "all"),
+        ("mute/high_left", "On", "single"),
+    ],
+)
+def test_post_command_reads_use_full_read_cycle_deadline(
+    monkeypatch,
+    topic: str,
+    payload: str,
+    operation: str,
+) -> None:
+    bridge, _, pa2, controller = make_bridge(monkeypatch)
+    identity_deadlines: list[float] = []
+    state_deadlines: list[float] = []
+    publish_deadlines: list[float] = []
+    detail_deadlines: list[float] = []
+    monkeypatch.setattr("pa2bridge.mqtt_bridge.time.monotonic", lambda: 100.0)
+
+    def identity(*, deadline: float):
+        identity_deadlines.append(deadline)
+        return controller.identity_value
+
+    def activate(target, *, unmute_after, identity, start_deadline):
+        del target, unmute_after, identity, start_deadline
+        pa2.connection_generation += 1
+        return controller.state_value
+
+    def state(*, identity, deadline: float):
+        state_deadlines.append(deadline)
+        return Pa2State(
+            identity,
+            controller.state_value.current_preset,
+            controller.state_value.output_mutes,
+        )
+
+    monkeypatch.setattr(controller, "identity", identity)
+    monkeypatch.setattr(controller, "state", state)
+    if operation == "preset":
+        monkeypatch.setattr(controller, "activate_preset", activate)
+    elif operation == "all":
+        monkeypatch.setattr(
+            controller,
+            "set_all_outputs_muted",
+            lambda muted, *, start_deadline: None,
+        )
+    else:
+        monkeypatch.setattr(
+            controller,
+            "set_output_muted",
+            lambda channel, muted, *, start_deadline: None,
+        )
+    monkeypatch.setattr(
+        bridge,
+        "publish_state",
+        lambda state, *, deadline: publish_deadlines.append(deadline),
+    )
+    monkeypatch.setattr(
+        bridge,
+        "_refresh_details",
+        lambda *, current_slot, deadline: detail_deadlines.append(deadline),
+    )
+
+    bridge._on_message(
+        None,
+        None,
+        message(f"driverack/pa2/command/{topic}", payload),
+    )
+    bridge._process_queued_command()
+
+    assert publish_deadlines == [160.0]
+    if operation == "preset":
+        assert identity_deadlines == [105.0, 160.0]
+        assert state_deadlines == []
+        assert detail_deadlines == [160.0]
+    else:
+        assert identity_deadlines == [160.0]
+        assert state_deadlines == [160.0]
+        assert detail_deadlines == []
 
 
 def test_disconnect_before_suback_keeps_startup_gate_closed(monkeypatch) -> None:
@@ -1185,8 +1435,8 @@ def test_command_transport_failure_closes_pa2_and_publishes_offline(monkeypatch)
     bridge, client, pa2, controller = make_bridge(monkeypatch)
     pa2.connected = True
 
-    def transport_failure(payload, *, unmute_after, identity=None):
-        del payload, unmute_after, identity
+    def transport_failure(payload, *, unmute_after, identity=None, start_deadline=None):
+        del payload, unmute_after, identity, start_deadline
         raise OSError("PA2 connection lost")
 
     controller.activate_preset = transport_failure
@@ -1210,7 +1460,8 @@ def test_unexpected_post_actuation_failure_closes_pa2_and_publishes_offline(
     pa2.connected = True
     sentinel = "PRIVATE-RUNTIME-PAYLOAD-41"
 
-    def unexpected_failure(muted):
+    def unexpected_failure(muted, *, start_deadline=None):
+        del start_deadline
         assert muted is False
         raise RuntimeError(sentinel)
 
@@ -1376,20 +1627,22 @@ def test_sigterm_waits_for_inflight_pa2_mutation_and_skips_followup_reads(
 ) -> None:
     bridge, _, _, controller = make_bridge(monkeypatch)
     mutation_finished = False
+    followup_reads: list[tuple[object, object]] = []
 
-    def mutate(muted: bool) -> None:
+    def mutate(muted: bool, *, start_deadline: float) -> None:
         nonlocal mutation_finished
         assert muted is False
+        assert start_deadline > time.monotonic()
         bridge._handle_sigterm(signal.SIGTERM, None)
         assert bridge._stop_event.is_set() is False
         mutation_finished = True
 
-    def forbidden_state(*, identity=None, deadline=None):
-        del identity, deadline
-        raise AssertionError("shutdown performed a follow-up PA2 read")
+    def record_state(*, identity=None, deadline=None):
+        followup_reads.append((identity, deadline))
+        return controller.state_value
 
     monkeypatch.setattr(controller, "set_all_outputs_muted", mutate)
-    monkeypatch.setattr(controller, "state", forbidden_state)
+    monkeypatch.setattr(controller, "state", record_state)
     bridge._on_message(
         None,
         None,
@@ -1399,6 +1652,7 @@ def test_sigterm_waits_for_inflight_pa2_mutation_and_skips_followup_reads(
     bridge._process_queued_command()
 
     assert mutation_finished is True
+    assert followup_reads == []
     assert bridge._stop_event.is_set()
 
 
@@ -1423,8 +1677,10 @@ def test_pa2_connect_waits_for_inflight_command_transaction(monkeypatch) -> None
     release_command = threading.Event()
     connect_started = threading.Event()
 
-    def blocking_activation(payload, *, unmute_after, identity=None):
-        del payload, unmute_after, identity
+    def blocking_activation(
+        payload, *, unmute_after, identity=None, start_deadline=None
+    ):
+        del payload, unmute_after, identity, start_deadline
         command_entered.set()
         assert release_command.wait(timeout=2)
         return controller.state_value
@@ -1466,8 +1722,10 @@ def test_failed_poll_waits_for_command_then_closes_inside_same_transaction(monke
     poll_started = threading.Event()
     poll_finished = threading.Event()
 
-    def blocking_activation(payload, *, unmute_after, identity=None):
-        del payload, unmute_after, identity
+    def blocking_activation(
+        payload, *, unmute_after, identity=None, start_deadline=None
+    ):
+        del payload, unmute_after, identity, start_deadline
         command_entered.set()
         assert release_command.wait(timeout=2)
         return controller.state_value
@@ -1530,8 +1788,8 @@ def test_poll_failure_invalidates_core_and_detail_availability(monkeypatch) -> N
 def test_preset_command_invalidates_details_before_device_recall(monkeypatch) -> None:
     bridge, client, _, controller = make_bridge(monkeypatch)
 
-    def activation(payload, *, unmute_after, identity=None):
-        del payload, unmute_after, identity
+    def activation(payload, *, unmute_after, identity=None, start_deadline=None):
+        del payload, unmute_after, identity, start_deadline
         assert client.published[-1] == (
             "driverack/pa2/status/details",
             "offline",

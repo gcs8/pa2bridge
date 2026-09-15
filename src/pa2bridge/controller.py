@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from .config import MAX_PRESET_SLOT, MAX_RECALL_TIMEOUT_SECONDS
-from .protocol import ProtocolError
+from .protocol import ProtocolError, ProtocolStartDeadlineExpired
 
 
 PRESET_ROOT = ("Storage", "Presets", "SV")
@@ -92,6 +92,15 @@ class Client(Protocol):
 
     def set_before(
         self, path: Iterable[str], value: str, *, deadline: float
+    ) -> None: ...
+
+    def set_starting_before(
+        self,
+        path: Iterable[str],
+        value: str,
+        *,
+        start_deadline: float,
+        deadline: float,
     ) -> None: ...
 
     def ls(self, path: Iterable[str]) -> dict[str, str]: ...
@@ -386,36 +395,46 @@ class Pa2Controller:
         *,
         unmute_after: bool = True,
         identity: DeviceIdentity | None = None,
+        start_deadline: float | None = None,
     ) -> Pa2State:
         with self._lock:
             deadline = self._new_operation_deadline()
+            admission_deadline = self._admission_deadline(
+                start_deadline,
+                operation_deadline=deadline,
+            )
             self._active_recall_deadline = deadline
             outputs_touched = False
             try:
-                preset = self._resolve_preset(target, deadline=deadline)
+                preset = self._resolve_preset(target, deadline=admission_deadline)
                 current = _parse_unsigned_integer(
                     "CurrentPreset",
-                    self._client_get(CURRENT_PRESET, deadline=deadline),
+                    self._client_get(CURRENT_PRESET, deadline=admission_deadline),
                     minimum=1,
                 )
-                self._require_unmute_before(deadline)
+                self._require_unmute_before(admission_deadline)
                 if current == preset.slot:
                     if identity is None:
                         identity = DeviceIdentity(
                             class_name=self._client_get(
-                                ("Node", "AT", "Class_Name"), deadline=deadline
+                                ("Node", "AT", "Class_Name"),
+                                deadline=admission_deadline,
                             ),
                             instance_name=self._client_get(
-                                ("Node", "AT", "Instance_Name"), deadline=deadline
+                                ("Node", "AT", "Instance_Name"),
+                                deadline=admission_deadline,
                             ),
                             firmware=self._client_get(
-                                ("Node", "AT", "Software_Version"), deadline=deadline
+                                ("Node", "AT", "Software_Version"),
+                                deadline=admission_deadline,
                             ),
                         )
                     return Pa2State(
                         identity=identity,
                         current_preset=preset,
-                        output_mutes=self._read_all_output_mutes(deadline=deadline),
+                        output_mutes=self._read_all_output_mutes(
+                            deadline=admission_deadline
+                        ),
                     )
                 outputs_touched = True
                 return self._activate_resolved_preset(
@@ -423,7 +442,10 @@ class Pa2Controller:
                     unmute_after=unmute_after,
                     deadline=deadline,
                     identity=identity,
+                    first_write_deadline=admission_deadline,
                 )
+            except ProtocolStartDeadlineExpired:
+                raise
             except Exception as error:
                 if not outputs_touched:
                     raise
@@ -450,6 +472,7 @@ class Pa2Controller:
         unmute_after: bool,
         deadline: float,
         identity: DeviceIdentity | None,
+        first_write_deadline: float | None = None,
     ) -> Pa2State:
         with self._lock:
             # Recall is only allowed after every output has been positively
@@ -457,6 +480,7 @@ class Pa2Controller:
             initial_mutes = self._set_all_outputs_muted(
                 True,
                 deadline=deadline,
+                first_write_deadline=first_write_deadline,
             )
             if identity is None:
                 identity = DeviceIdentity(
@@ -629,7 +653,13 @@ class Pa2Controller:
                 f"current preset slot {current} was absent from the fresh catalog"
             ) from error
 
-    def set_output_muted(self, channel: str, muted: bool) -> bool:
+    def set_output_muted(
+        self,
+        channel: str,
+        muted: bool,
+        *,
+        start_deadline: float | None = None,
+    ) -> bool:
         try:
             path = OUTPUT_MUTES[channel]
         except KeyError as error:
@@ -637,14 +667,22 @@ class Pa2Controller:
         expected = "On" if muted else "Off"
         with self._lock:
             deadline = self._new_operation_deadline()
+            admission_deadline = self._admission_deadline(
+                start_deadline,
+                operation_deadline=deadline,
+            )
             expected_preset = None
             if not muted:
                 expected_preset = self._verify_current_preset_before_unmute(
-                    deadline=deadline
+                    deadline=admission_deadline
                 )
             try:
-                self._require_unmute_before(deadline)
-                self._client_set(path, expected, deadline=deadline)
+                self._client_set_starting_before(
+                    path,
+                    expected,
+                    start_deadline=admission_deadline,
+                    deadline=deadline,
+                )
                 self._require_unmute_before(deadline)
                 actual = self._client_get(path, deadline=deadline)
                 self._require_unmute_before(deadline)
@@ -660,6 +698,8 @@ class Pa2Controller:
                         raise OutputVerificationError(
                             "current preset changed during unmute"
                         )
+            except ProtocolStartDeadlineExpired:
+                raise
             except Exception as error:
                 try:
                     self._rollback_outputs_to_muted(
@@ -697,6 +737,22 @@ class Pa2Controller:
             raise RecallTimeout("monotonic clock could not establish a finite deadline")
         return deadline
 
+    def _admission_deadline(
+        self,
+        start_deadline: float | None,
+        *,
+        operation_deadline: float,
+    ) -> float:
+        if start_deadline is None:
+            return operation_deadline
+        if (
+            not isinstance(start_deadline, (int, float))
+            or isinstance(start_deadline, bool)
+            or not math.isfinite(start_deadline)
+        ):
+            raise RecallTimeout("command start deadline must be finite")
+        return min(float(start_deadline), operation_deadline)
+
     def _client_get(self, path: Iterable[str], *, deadline: float | None) -> str:
         if deadline is not None:
             return self.client.get_before(path, deadline=deadline)
@@ -713,6 +769,21 @@ class Pa2Controller:
             self.client.set_before(path, value, deadline=deadline)
             return
         self.client.set(path, value)
+
+    def _client_set_starting_before(
+        self,
+        path: Iterable[str],
+        value: str,
+        *,
+        start_deadline: float,
+        deadline: float,
+    ) -> None:
+        self.client.set_starting_before(
+            path,
+            value,
+            start_deadline=start_deadline,
+            deadline=deadline,
+        )
 
     def _client_ls(
         self,
@@ -735,12 +806,23 @@ class Pa2Controller:
         expected: str,
         *,
         deadline: float | None = None,
+        first_write_deadline: float | None = None,
     ) -> dict[str, bool]:
         expected_muted = expected == "On"
         ordered = tuple(OUTPUT_MUTES.items())
         for index, (channel, path) in enumerate(ordered):
-            self._require_unmute_before(deadline)
-            self._client_set(path, expected, deadline=deadline)
+            if index == 0 and first_write_deadline is not None:
+                if deadline is None:
+                    raise AssertionError("first write deadline requires operation deadline")
+                self._client_set_starting_before(
+                    path,
+                    expected,
+                    start_deadline=first_write_deadline,
+                    deadline=deadline,
+                )
+            else:
+                self._require_unmute_before(deadline)
+                self._client_set(path, expected, deadline=deadline)
             self._require_unmute_before(deadline)
             actual = _parse_output_mute(
                 channel,
@@ -890,26 +972,45 @@ class Pa2Controller:
     def set_all_outputs_muted(
         self,
         muted: bool,
+        *,
+        start_deadline: float | None = None,
     ) -> dict[str, bool]:
         with self._lock:
             deadline = self._new_operation_deadline()
-            return self._set_all_outputs_muted(muted, deadline=deadline)
+            admission_deadline = self._admission_deadline(
+                start_deadline,
+                operation_deadline=deadline,
+            )
+            return self._set_all_outputs_muted(
+                muted,
+                deadline=deadline,
+                first_write_deadline=admission_deadline,
+            )
 
     def _set_all_outputs_muted(
         self,
         muted: bool,
         *,
         deadline: float,
+        first_write_deadline: float | None = None,
     ) -> dict[str, bool]:
         expected = "On" if muted else "Off"
         with self._lock:
             expected_preset = None
             if not muted:
                 expected_preset = self._verify_current_preset_before_unmute(
-                    deadline=deadline
+                    deadline=(
+                        first_write_deadline
+                        if first_write_deadline is not None
+                        else deadline
+                    )
                 )
             try:
-                readback = self._write_all_outputs(expected, deadline=deadline)
+                readback = self._write_all_outputs(
+                    expected,
+                    deadline=deadline,
+                    first_write_deadline=first_write_deadline,
+                )
                 if expected_preset is not None:
                     final_preset = self._verify_current_preset_before_unmute(
                         deadline=deadline
@@ -919,6 +1020,8 @@ class Pa2Controller:
                             "current preset changed during unmute"
                         )
                 return readback
+            except ProtocolStartDeadlineExpired:
+                raise
             except Exception as error:
                 try:
                     self._rollback_outputs_to_muted(

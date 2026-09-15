@@ -25,6 +25,10 @@ class ProtocolTimeout(ProtocolError):
     """A bounded PA2 operation timed out."""
 
 
+class ProtocolStartDeadlineExpired(ProtocolTimeout):
+    """An actuator operation was rejected before its first write started."""
+
+
 class MalformedFrameError(ProtocolError):
     """The PA2 returned bytes that are not a valid console frame."""
 
@@ -283,12 +287,38 @@ class HiQnetClient:
     ) -> None:
         self._set(path, value, deadline=self._bounded_deadline(deadline))
 
-    def _set(self, path: Iterable[str], value: str, *, deadline: float) -> None:
+    def set_starting_before(
+        self,
+        path: Iterable[str],
+        value: str,
+        *,
+        start_deadline: float,
+        deadline: float,
+    ) -> None:
+        self._set(
+            path,
+            value,
+            deadline=self._bounded_deadline(deadline),
+            start_deadline=self._bounded_deadline(start_deadline),
+        )
+
+    def _set(
+        self,
+        path: Iterable[str],
+        value: str,
+        *,
+        deadline: float,
+        start_deadline: float | None = None,
+    ) -> None:
         _validate_atom(value, description="value")
         encoded = encode_path(path)
         with self._lock:
             command = f'set "{encoded}" "{value}"'
-            self._send(command, deadline=deadline)
+            self._send(
+                command,
+                deadline=deadline,
+                start_deadline=start_deadline,
+            )
             self._pending_set_echoes.append(command)
 
     def ls(self, path: Iterable[str]) -> dict[str, str]:
@@ -368,13 +398,27 @@ class HiQnetClient:
             raise ValueError("deadline must be an absolute monotonic timestamp")
         return min(local_deadline, float(deadline))
 
-    def _send(self, command: str, *, deadline: float | None = None) -> None:
-        if deadline is not None:
+    def _send(
+        self,
+        command: str,
+        *,
+        deadline: float | None = None,
+        start_deadline: float | None = None,
+    ) -> None:
+        effective_start: float | None = None
+        if start_deadline is not None:
+            effective_start = (
+                min(start_deadline, deadline) if deadline is not None else start_deadline
+            )
+            self._require_start_before_deadline(effective_start)
+        elif deadline is not None:
             self._require_before_deadline(deadline)
         if self._socket is None:
             raise ProtocolError("PA2 session is not connected")
         try:
-            if deadline is not None:
+            if effective_start is not None:
+                self._require_start_before_deadline(effective_start)
+            elif deadline is not None:
                 self._require_before_deadline(deadline)
             self._socket.sendall((command + "\n").encode("utf-8"))
         except OSError as error:
@@ -445,6 +489,13 @@ class HiQnetClient:
         if time.monotonic() >= deadline:
             self.close()
             raise ProtocolTimeout("timed out waiting for PA2 response")
+
+    def _require_start_before_deadline(self, deadline: float) -> None:
+        if time.monotonic() >= deadline:
+            self.close()
+            raise ProtocolStartDeadlineExpired(
+                "command expired before its first PA2 actuator write"
+            )
 
     def _raise_if_error(self, line: str) -> None:
         match = _ERROR_RE.fullmatch(line)

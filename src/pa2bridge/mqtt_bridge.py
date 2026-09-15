@@ -33,6 +33,7 @@ from .protocol import HiQnetClient, ProtocolError
 LOGGER = logging.getLogger(__name__)
 DETAIL_REFRESH_INTERVAL = 60.0
 SHUTDOWN_PUBLISH_TIMEOUT = 5.0
+COMMAND_TTL_SECONDS = 5.0
 PA2_READ_CYCLE_TIMEOUT = 60.0
 
 
@@ -59,6 +60,7 @@ class QueuedCommand:
     topic: str
     payload: str
     mqtt_generation: int
+    received_at: float
 
 
 def _device_payload(device: DeviceInfo) -> dict[str, Any]:
@@ -855,6 +857,7 @@ class MqttBridge:
 
     def _on_message(self, client, userdata, message) -> None:
         del client, userdata
+        received_at = time.monotonic()
         base = self.config.mqtt.base_topic
         try:
             topic = message.topic
@@ -881,7 +884,12 @@ class MqttBridge:
                 if self._mqtt_failure is not None or not self._mqtt_connected:
                     raise ValueError("MQTT command arrived outside an active session")
                 self._commands.put_nowait(
-                    QueuedCommand(topic, payload, self._mqtt_generation)
+                    QueuedCommand(
+                        topic,
+                        payload,
+                        self._mqtt_generation,
+                        received_at,
+                    )
                 )
         except (UnicodeDecodeError, ValueError, Full):
             try:
@@ -917,8 +925,24 @@ class MqttBridge:
                 self._details_valid = False
                 self.pa2_client.close()
             return True
+        if self._command_expired(command):
+            self._publish_stale_command()
+            return True
         self._execute_command(command)
         return True
+
+    def _command_expired(self, command: QueuedCommand) -> bool:
+        return time.monotonic() - command.received_at >= COMMAND_TTL_SECONDS
+
+    def _command_deadline(self, command: QueuedCommand) -> float:
+        return command.received_at + COMMAND_TTL_SECONDS
+
+    def _publish_stale_command(self) -> None:
+        self._publish(
+            f"{self.config.mqtt.base_topic}/state/last_command",
+            "ERROR: stale command discarded",
+            retain=True,
+        )
 
     def _execute_command(self, command: QueuedCommand) -> None:
         base = self.config.mqtt.base_topic
@@ -938,6 +962,9 @@ class MqttBridge:
                     self._details_valid = False
                     self.pa2_client.close()
                     return
+                if self._command_expired(command):
+                    self._publish_stale_command()
+                    return
                 try:
                     if self._apply_pending_sigterm():
                         return
@@ -947,7 +974,9 @@ class MqttBridge:
                         self._publish(
                             f"{base}/status/details", "offline", retain=True
                         )
-                        identity = self._identity_for_connection()
+                        identity = self._identity_for_connection(
+                            deadline=self._command_deadline(command)
+                        )
                         if self._apply_pending_sigterm():
                             return
                         device_touched = True
@@ -955,6 +984,7 @@ class MqttBridge:
                             command.payload,
                             unmute_after=True,
                             identity=identity,
+                            start_deadline=self._command_deadline(command),
                         )
                         if self._apply_pending_sigterm():
                             return
@@ -974,7 +1004,10 @@ class MqttBridge:
                         refresh_details = True
                     elif command.topic == f"{base}/command/unmute":
                         device_touched = True
-                        self.controller.set_all_outputs_muted(False)
+                        self.controller.set_all_outputs_muted(
+                            False,
+                            start_deadline=self._command_deadline(command),
+                        )
                         if self._apply_pending_sigterm():
                             return
                         post_command_deadline = (
@@ -991,7 +1024,9 @@ class MqttBridge:
                         channel = command.topic.rsplit("/", 1)[-1]
                         device_touched = True
                         self.controller.set_output_muted(
-                            channel, command.payload == "On"
+                            channel,
+                            command.payload == "On",
+                            start_deadline=self._command_deadline(command),
                         )
                         if self._apply_pending_sigterm():
                             return
