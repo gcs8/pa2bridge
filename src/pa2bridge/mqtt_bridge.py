@@ -16,6 +16,7 @@ import threading
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from http.client import HTTPException
 from pathlib import Path
 from queue import Empty, Full, Queue
 from typing import Any
@@ -258,7 +259,7 @@ def _discover_mac_address_from_home_assistant(
         )
         with urlopen(request, timeout=request_timeout) as response:
             raw = response.read(_MAX_HA_STATES_BYTES + 1)
-    except (OSError, URLError, ValueError):
+    except (HTTPException, OSError, URLError, ValueError):
         return None
     if len(raw) > _MAX_HA_STATES_BYTES:
         return None
@@ -390,7 +391,7 @@ def _trusted_home_assistant_trackers(
         )
         with urlopen(request, timeout=request_timeout) as response:
             raw_entries = response.read(_MAX_HA_CONFIG_ENTRIES_BYTES + 1)
-    except (OSError, URLError, ValueError):
+    except (HTTPException, OSError, URLError, ValueError):
         return frozenset()
     if (
         len(raw_mapping) > _MAX_HA_TEMPLATE_BYTES

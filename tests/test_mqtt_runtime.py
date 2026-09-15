@@ -8,6 +8,7 @@ import stat
 import threading
 import time
 from datetime import UTC, datetime, timedelta
+from http.client import IncompleteRead
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -1009,6 +1010,61 @@ def test_home_assistant_network_data_resolves_mac_across_layer_three(
     assert request.headers["Authorization"] == "Bearer synthetic-supervisor-token"
     assert 0 < timeout <= 3.0
     assert read_sizes == [16 * 1024 * 1024 + 1]
+
+
+def test_home_assistant_states_truncated_response_is_lookup_unavailable(
+    monkeypatch,
+) -> None:
+    def truncated_response(request, *, timeout):
+        del request, timeout
+        raise IncompleteRead(b"[", 100)
+
+    monkeypatch.setattr("pa2bridge.mqtt_bridge.urlopen", truncated_response)
+
+    assert (
+        _discover_mac_address_from_home_assistant(
+            "192.0.2.20",
+            "synthetic-supervisor-token",
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize("failed_request", ("template", "config_entries"))
+def test_home_assistant_provenance_truncated_response_is_lookup_unavailable(
+    monkeypatch,
+    failed_request: str,
+) -> None:
+    class MappingResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self, size: int) -> bytes:
+            del size
+            return b'{"device_tracker.pa2":"trusted-entry"}'
+
+    calls = 0
+
+    def urlopen(request, *, timeout):
+        nonlocal calls
+        del request, timeout
+        calls += 1
+        if failed_request == "template" or calls == 2:
+            raise IncompleteRead(b"{", 100)
+        return MappingResponse()
+
+    monkeypatch.setattr("pa2bridge.mqtt_bridge.urlopen", urlopen)
+
+    assert (
+        _trusted_home_assistant_trackers(
+            frozenset({"device_tracker.pa2"}),
+            "synthetic-supervisor-token",
+        )
+        == frozenset()
+    )
 
 
 def test_home_assistant_network_data_rejects_oversized_response(monkeypatch) -> None:
