@@ -302,29 +302,39 @@ class Pa2Controller:
         self._lock = threading.RLock()
         self._active_recall_deadline: float | None = None
 
-    def identity(self) -> DeviceIdentity:
+    def identity(self, *, deadline: float | None = None) -> DeviceIdentity:
         with self._lock:
             return DeviceIdentity(
-                class_name=self.client.get(("Node", "AT", "Class_Name")),
-                instance_name=self.client.get(("Node", "AT", "Instance_Name")),
-                firmware=self.client.get(("Node", "AT", "Software_Version")),
+                class_name=self._client_get(
+                    ("Node", "AT", "Class_Name"), deadline=deadline
+                ),
+                instance_name=self._client_get(
+                    ("Node", "AT", "Instance_Name"), deadline=deadline
+                ),
+                firmware=self._client_get(
+                    ("Node", "AT", "Software_Version"), deadline=deadline
+                ),
             )
 
-    def list_presets(self) -> list[Preset]:
-        allowed, _ = self.list_preset_views()
+    def list_presets(self, *, deadline: float | None = None) -> list[Preset]:
+        allowed, _ = self.list_preset_views(deadline=deadline)
         return allowed
 
-    def list_all_presets(self) -> list[Preset]:
+    def list_all_presets(self, *, deadline: float | None = None) -> list[Preset]:
         """Return the complete device catalog without expanding recall access."""
 
-        _, complete = self.list_preset_views()
+        _, complete = self.list_preset_views(deadline=deadline)
         return complete
 
-    def list_preset_views(self) -> tuple[list[Preset], list[Preset]]:
+    def list_preset_views(
+        self,
+        *,
+        deadline: float | None = None,
+    ) -> tuple[list[Preset], list[Preset]]:
         """Return allowed and complete views from one validated device snapshot."""
 
         with self._lock:
-            catalog = self._preset_catalog()
+            catalog = self._preset_catalog(deadline=deadline)
             complete = [preset for _, preset in sorted(catalog.items())]
             if self.allowed_slots is None:
                 allowed = list(complete)
@@ -334,25 +344,38 @@ class Pa2Controller:
                 ]
             return allowed, complete
 
-    def current_preset(self) -> Preset:
+    def current_preset(self, *, deadline: float | None = None) -> Preset:
         with self._lock:
             slot = _parse_unsigned_integer(
-                "CurrentPreset", self.client.get(CURRENT_PRESET), minimum=1
+                "CurrentPreset",
+                self._client_get(CURRENT_PRESET, deadline=deadline),
+                minimum=1,
             )
             try:
-                return self._preset_catalog(expected_current=slot)[slot]
+                return self._preset_catalog(
+                    expected_current=slot,
+                    deadline=deadline,
+                )[slot]
             except KeyError as error:
                 raise TelemetryError(
                     f"CurrentPreset slot {slot} was absent from the complete preset catalog"
                 ) from error
 
-    def state(self, *, identity: DeviceIdentity | None = None) -> Pa2State:
+    def state(
+        self,
+        *,
+        identity: DeviceIdentity | None = None,
+        deadline: float | None = None,
+    ) -> Pa2State:
         with self._lock:
             return Pa2State(
-                identity=self.identity() if identity is None else identity,
-                current_preset=self.current_preset(),
+                identity=self.identity(deadline=deadline) if identity is None else identity,
+                current_preset=self.current_preset(deadline=deadline),
                 output_mutes={
-                    channel: _parse_output_mute(channel, self.client.get(path))
+                    channel: _parse_output_mute(
+                        channel,
+                        self._client_get(path, deadline=deadline),
+                    )
                     for channel, path in OUTPUT_MUTES.items()
                 },
             )
@@ -370,6 +393,30 @@ class Pa2Controller:
             outputs_touched = False
             try:
                 preset = self._resolve_preset(target, deadline=deadline)
+                current = _parse_unsigned_integer(
+                    "CurrentPreset",
+                    self._client_get(CURRENT_PRESET, deadline=deadline),
+                    minimum=1,
+                )
+                self._require_unmute_before(deadline)
+                if current == preset.slot:
+                    if identity is None:
+                        identity = DeviceIdentity(
+                            class_name=self._client_get(
+                                ("Node", "AT", "Class_Name"), deadline=deadline
+                            ),
+                            instance_name=self._client_get(
+                                ("Node", "AT", "Instance_Name"), deadline=deadline
+                            ),
+                            firmware=self._client_get(
+                                ("Node", "AT", "Software_Version"), deadline=deadline
+                            ),
+                        )
+                    return Pa2State(
+                        identity=identity,
+                        current_preset=preset,
+                        output_mutes=self._read_all_output_mutes(deadline=deadline),
+                    )
                 outputs_touched = True
                 return self._activate_resolved_preset(
                     preset,
@@ -893,34 +940,41 @@ class Pa2Controller:
                     f"unmute failed ({error}); rolled back to muted"
                 ) from error
 
-    def output_levels(self) -> dict[str, float]:
+    def output_levels(self, *, deadline: float | None = None) -> dict[str, float]:
         with self._lock:
             return {
-                channel: _parse_db(channel, self.client.get(path))
+                channel: _parse_db(
+                    channel,
+                    self._client_get(path, deadline=deadline),
+                )
                 for channel, path in OUTPUT_LEVELS.items()
             }
 
-    def input_meters(self) -> InputMeters:
+    def input_meters(self, *, deadline: float | None = None) -> InputMeters:
         with self._lock:
             return InputMeters(
                 levels_dbfs={
-                    side: _parse_db(f"{side} input", self.client.get(path))
+                    side: _parse_db(
+                        f"{side} input",
+                        self._client_get(path, deadline=deadline),
+                    )
                     for side, path in INPUT_LEVELS.items()
                 },
                 clips={
                     side: _parse_binary_flag(
-                        f"{side} input clip", self.client.get(path)
+                        f"{side} input clip",
+                        self._client_get(path, deadline=deadline),
                     )
                     for side, path in INPUT_CLIPS.items()
                 },
             )
 
-    def crossover(self) -> CrossoverState:
+    def crossover(self, *, deadline: float | None = None) -> CrossoverState:
         """Read topology and every reported HPF/LPF curve parameter."""
 
         with self._lock:
-            attributes = self.client.ls(CROSSOVER_AT)
-            values = self.client.ls(CROSSOVER_SV)
+            attributes = self._client_ls(CROSSOVER_AT, deadline=deadline)
+            values = self._client_ls(CROSSOVER_SV, deadline=deadline)
             topology_keys = set(attributes)
             missing_keys = _CROSSOVER_TOPOLOGY_REQUIRED_KEYS - topology_keys
             unexpected_keys = (
