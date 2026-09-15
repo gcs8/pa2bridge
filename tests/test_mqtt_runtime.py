@@ -1213,6 +1213,31 @@ def test_run_forever_uses_paho_background_loop_for_automatic_broker_reconnect(mo
     assert ("driverack/pa2/status", "offline", 1, True) in client.published
 
 
+def test_run_forever_releases_pa2_lock_before_stopping_mqtt_loop(monkeypatch) -> None:
+    bridge, client, pa2, controller = make_bridge(monkeypatch)
+    monkeypatch.setattr(bridge, "_connect_pa2", lambda: setattr(pa2, "connected", True))
+    controller.raise_keyboard_on_state = True
+
+    def loop_stop() -> None:
+        callback_finished = threading.Event()
+
+        def disconnect_callback() -> None:
+            with bridge._pa2_lock:
+                callback_finished.set()
+
+        callback_thread = threading.Thread(target=disconnect_callback)
+        callback_thread.start()
+        callback_thread.join(timeout=1)
+        assert callback_finished.is_set()
+        client.loop_stopped += 1
+
+    client.loop_stop = loop_stop  # type: ignore[method-assign]
+
+    bridge.run_forever()
+
+    assert client.loop_stopped == 1
+
+
 def test_unacknowledged_shutdown_publication_fails_closed(monkeypatch) -> None:
     bridge, _, _, _ = make_bridge(monkeypatch)
     result = SimpleNamespace(
