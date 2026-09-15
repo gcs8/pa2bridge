@@ -93,21 +93,21 @@ def test_ha_app_rejects_password_the_connect_frame_cannot_carry(
 def test_loaders_still_accept_ordinary_custom_credentials(tmp_path: Path) -> None:
     config = load_config(
         _toml(tmp_path / "config.toml", username="tech-1", password_env=True),
-        environ={"PA2_PASSWORD": "S3cret pass\word!"},
+        environ={"PA2_PASSWORD": r"S3cret pass\word!"},
     )
     assert config.pa2.username == "tech-1"
-    assert config.pa2.password == "S3cret pass\word!"
+    assert config.pa2.password == r"S3cret pass\word!"
 
     ha_config = load_ha_app_config(
         _options(
             tmp_path / "options.json",
             pa2_username="tech-1",
-            pa2_password_override="S3cret pass\word!",
+            pa2_password_override=r"S3cret pass\word!",
         ),
         environ=_MQTT_ENV,
     )
     assert ha_config.pa2.username == "tech-1"
-    assert ha_config.pa2.password == "S3cret pass\word!"
+    assert ha_config.pa2.password == r"S3cret pass\word!"
 
 
 def test_protocol_rejects_whitespace_username_before_opening_a_socket() -> None:
