@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import json
+import os
 import signal
+import stat
 import threading
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 import paho.mqtt.client as mqtt
@@ -19,7 +22,17 @@ from pa2bridge.controller import (
     Preset,
     TelemetryError,
 )
-from pa2bridge.mqtt_bridge import MqttBridge, MqttPublishError
+from pa2bridge.mqtt_bridge import (
+    DiscoveryStateError,
+    MqttBridge,
+    MqttPublishError,
+    _fsync_directory,
+    _load_discovery_topics,
+    _marker_payload,
+    _save_discovery_topics,
+    _state_directory_inner_marker,
+    _state_directory_marker,
+)
 
 
 class FakeMqttClient:
@@ -92,6 +105,7 @@ class FakeMqttClient:
         def wait_for_publish(timeout=None):
             del timeout
             self.wait_for_publish_calls += 1
+            self.events.append(("wait", topic))
 
         return SimpleNamespace(
             rc=mqtt.MQTT_ERR_SUCCESS,
@@ -243,10 +257,10 @@ class FakeController:
         self.channel_mutes.append((channel, muted))
 
 
-def make_config(*, expose_meters=False):
+def make_config(*, expose_meters=False, pa2_host="192.0.2.20"):
     return AppConfig(
         pa2=Pa2Config(
-            host="192.0.2.20",
+            host=pa2_host,
             password="pa2-secret",
             allowed_preset_slots=(1, 2),
         ),
@@ -259,13 +273,22 @@ def make_config(*, expose_meters=False):
     )
 
 
-def make_bridge(monkeypatch, *, expose_meters=False):
+def make_bridge(
+    monkeypatch,
+    *,
+    expose_meters=False,
+    pa2_host="192.0.2.20",
+    discovery_state_path: Path | None = None,
+):
     fake_mqtt = FakeMqttClient()
     monkeypatch.setattr(
         "pa2bridge.mqtt_bridge.mqtt.Client",
         lambda *args, **kwargs: fake_mqtt,
     )
-    bridge = MqttBridge(make_config(expose_meters=expose_meters))
+    bridge = MqttBridge(
+        make_config(expose_meters=expose_meters, pa2_host=pa2_host),
+        discovery_state_path=discovery_state_path,
+    )
     fake_pa2 = FakePa2Client()
     controller = FakeController()
     bridge.pa2_client = fake_pa2
@@ -305,6 +328,699 @@ def test_connect_builds_discovery_and_on_connect_publishes_and_subscribes(monkey
     assert crossover["summary"] == "1 band + mono sub"
     assert crossover["bands"][0]["high_pass_hz"] is None
     assert ("driverack/pa2/status/details", "online", 1, True) in client.published
+
+
+def test_discovery_publish_clears_persisted_old_topics_before_current_topics(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    state_path = tmp_path / "discovery-state.json"
+    old_bridge, _, _, _ = make_bridge(
+        monkeypatch,
+        pa2_host="192.0.2.10",
+        discovery_state_path=state_path,
+    )
+    old_bridge._connect_pa2()
+    old_bridge._publish_discovery(old_bridge.discovery)
+    old_topics = sorted(
+        message.topic for message in old_bridge.discovery if message.payload
+    )
+
+    bridge, client, _, _ = make_bridge(
+        monkeypatch,
+        pa2_host="192.0.2.20",
+        discovery_state_path=state_path,
+    )
+    bridge._connect_pa2()
+
+    bridge._poll_once()
+
+    config_publishes = [
+        (topic, payload)
+        for topic, payload, _, retain in client.published
+        if topic.endswith("/config") and retain
+    ]
+    assert config_publishes[: len(old_topics)] == [
+        (topic, "") for topic in old_topics
+    ]
+    first_current = next(
+        index for index, (_, payload) in enumerate(config_publishes) if payload
+    )
+    assert first_current == len(old_topics)
+    last_cleanup_ack = max(
+        client.events.index(("wait", topic)) for topic in old_topics
+    )
+    first_current_publish = client.events.index(
+        ("publish", bridge.discovery[0].topic, bridge.discovery[0].payload)
+    )
+    assert last_cleanup_ack < first_current_publish
+    persisted = json.loads(state_path.read_text(encoding="utf-8"))
+    expected_topics = sorted(
+        message.topic for message in bridge.discovery if message.payload
+    )
+    assert persisted == {"version": 1, "topics": expected_topics}
+    assert all(topic not in persisted["topics"] for topic in old_topics)
+    assert stat.S_IMODE(state_path.stat().st_mode) == 0o600
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        '{"version":1,"topics":["homeassistant/select/driverack_pa2_host/preset/config",7]}',
+        '{"version":1.0,"topics":[]}',
+        '{"version":1,"topics":["homeassistant/light/unrelated/device/config"]}',
+        '{"version":1,"topics":["homeassistant/select/driverack_pa2_host/preset/config","homeassistant/select/driverack_pa2_host/preset/config"]}',
+        r'{"version":1,"topics":["homeassistant/select/driverack_pa2_host/\ud800/config"]}',
+    ],
+)
+def test_malformed_discovery_state_fails_closed(
+    monkeypatch,
+    tmp_path: Path,
+    state: str,
+) -> None:
+    state_path = tmp_path / "discovery-state.json"
+    state_path.write_text(state, encoding="utf-8")
+    fake_mqtt = FakeMqttClient()
+    monkeypatch.setattr(
+        "pa2bridge.mqtt_bridge.mqtt.Client",
+        lambda *args, **kwargs: fake_mqtt,
+    )
+
+    with pytest.raises(DiscoveryStateError, match="discovery state"):
+        MqttBridge(make_config(), discovery_state_path=state_path)
+
+    assert fake_mqtt.published == []
+
+
+def test_discovery_state_read_is_bounded_before_size_validation() -> None:
+    read_sizes: list[int] = []
+
+    class Reader:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args) -> None:
+            del args
+
+        def read(self, size: int) -> bytes:
+            read_sizes.append(size)
+            return b"x" * size
+
+    class StatePath:
+        def open(self, mode: str) -> Reader:
+            assert mode == "rb"
+            return Reader()
+
+    with pytest.raises(DiscoveryStateError, match="size limit"):
+        _load_discovery_topics(StatePath())  # type: ignore[arg-type]
+
+    assert read_sizes == [64 * 1024 + 1]
+
+
+def test_discovery_ack_failure_tracks_partial_publication_for_future_cleanup(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    state_path = tmp_path / "discovery-state.json"
+    old_topic = "homeassistant/select/driverack_pa2_192_0_2_10/preset/config"
+    state_path.write_text(
+        json.dumps({"version": 1, "topics": [old_topic]}) + "\n",
+        encoding="utf-8",
+    )
+    bridge, client, _, _ = make_bridge(
+        monkeypatch,
+        discovery_state_path=state_path,
+    )
+    bridge._connect_pa2()
+    original_publish = client.publish
+    current_count = 0
+
+    def fail_second_current(topic, payload, qos, retain):
+        nonlocal current_count
+        result = original_publish(topic, payload, qos, retain)
+        if payload and topic.endswith("/config"):
+            current_count += 1
+            if current_count == 2:
+                result.is_published = lambda: False
+        return result
+
+    client.publish = fail_second_current
+
+    with pytest.raises(MqttPublishError, match="acknowledgement timed out"):
+        bridge._publish_discovery(bridge.discovery)
+
+    current_topics = {
+        message.topic for message in bridge.discovery if message.payload
+    }
+    pending_topics = current_topics | {old_topic}
+    assert json.loads(state_path.read_text(encoding="utf-8")) == {
+        "version": 1,
+        "topics": sorted(pending_topics),
+    }
+    assert bridge._persisted_discovery_topics == pending_topics
+
+    next_bridge, next_client, _, _ = make_bridge(
+        monkeypatch,
+        pa2_host="192.0.2.30",
+        discovery_state_path=state_path,
+    )
+    next_bridge._connect_pa2()
+    next_bridge._publish_discovery(next_bridge.discovery)
+    config_publishes = [
+        (topic, payload)
+        for topic, payload, _, retain in next_client.published
+        if topic.endswith("/config") and retain
+    ]
+    assert config_publishes[: len(pending_topics)] == [
+        (topic, "") for topic in sorted(pending_topics)
+    ]
+
+
+def test_discovery_state_replace_failure_preserves_previous_file(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    state_path = tmp_path / "discovery-state.json"
+    original = json.dumps(
+        {
+            "version": 1,
+            "topics": [
+                "homeassistant/select/driverack_pa2_192_0_2_10/preset/config"
+            ],
+        }
+    ) + "\n"
+    state_path.write_text(original, encoding="utf-8")
+    bridge, client, _, _ = make_bridge(
+        monkeypatch,
+        discovery_state_path=state_path,
+    )
+    bridge._connect_pa2()
+
+    def fail_replace(source, target) -> None:
+        del source, target
+        raise OSError("replace failed")
+
+    monkeypatch.setattr(
+        "pa2bridge.mqtt_bridge.os.replace",
+        fail_replace,
+    )
+
+    with pytest.raises(DiscoveryStateError, match="could not write"):
+        bridge._publish_discovery(bridge.discovery)
+
+    assert state_path.read_text(encoding="utf-8") == original
+    assert [entry.name for entry in tmp_path.iterdir()] == [state_path.name]
+    assert client.published == []
+
+
+def test_discovery_state_cleanup_failure_preserves_primary_error_contract(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    state_path = tmp_path / "discovery-state.json"
+    bridge, _, _, _ = make_bridge(
+        monkeypatch,
+        discovery_state_path=state_path,
+    )
+    bridge._connect_pa2()
+    original_unlink = os.unlink
+
+    def fail_replace(source, target) -> None:
+        del source, target
+        raise OSError("replace failed")
+
+    def fail_unlink(path) -> None:
+        del path
+        raise OSError("unlink failed")
+
+    monkeypatch.setattr("pa2bridge.mqtt_bridge.os.replace", fail_replace)
+    monkeypatch.setattr("pa2bridge.mqtt_bridge.os.unlink", fail_unlink)
+
+    with pytest.raises(DiscoveryStateError, match="replace failed"):
+        bridge._publish_discovery(bridge.discovery)
+
+    for entry in tmp_path.iterdir():
+        original_unlink(entry)
+
+
+def test_discovery_state_write_error_precedes_descriptor_close_error(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    temporary_path = tmp_path / ".discovery.json.temporary"
+    monkeypatch.setattr(
+        "pa2bridge.mqtt_bridge.tempfile.mkstemp",
+        lambda **kwargs: (12345, str(temporary_path)),
+    )
+    monkeypatch.setattr("pa2bridge.mqtt_bridge.os.fchmod", lambda *args: None)
+    monkeypatch.setattr(
+        "pa2bridge.mqtt_bridge.os.write",
+        lambda *args: (_ for _ in ()).throw(OSError("write-primary")),
+    )
+    original_close = os.close
+
+    def fail_temporary_close(descriptor: int) -> None:
+        if descriptor == 12345:
+            raise OSError("close-secondary")
+        original_close(descriptor)
+
+    monkeypatch.setattr(
+        "pa2bridge.mqtt_bridge.os.close",
+        fail_temporary_close,
+    )
+
+    with pytest.raises(DiscoveryStateError, match="write-primary"):
+        _save_discovery_topics(
+            tmp_path / "discovery.json",
+            frozenset(
+                {
+                    "homeassistant/select/driverack_pa2_host/preset/config"
+                }
+            ),
+        )
+
+
+def test_new_state_directory_entries_are_fsynced(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    state_path = tmp_path / "new" / "nested" / "discovery.json"
+    synced: list[Path] = []
+    monkeypatch.setattr(
+        "pa2bridge.mqtt_bridge._fsync_directory",
+        lambda path: synced.append(path),
+    )
+
+    _save_discovery_topics(
+        state_path,
+        frozenset(
+            {"homeassistant/select/driverack_pa2_host/preset/config"}
+        ),
+    )
+
+    assert synced == [
+        tmp_path,
+        tmp_path,
+        tmp_path,
+        tmp_path / "new",
+        tmp_path / "new",
+        tmp_path / "new",
+        tmp_path / "new",
+        state_path.parent,
+        state_path.parent,
+    ]
+    assert not list(tmp_path.rglob(".pa2bridge-state-dir-*.pending"))
+
+
+def test_state_save_does_not_fsync_preexisting_ancestors(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    state_path = tmp_path / "new" / "nested" / "discovery.json"
+    forbidden_ancestor = tmp_path.parent
+    original_fsync_directory = _fsync_directory
+    synced: list[Path] = []
+
+    def reject_preexisting_ancestor(path: Path) -> None:
+        synced.append(path)
+        if path == forbidden_ancestor:
+            raise PermissionError("ancestor is traversal-only")
+        original_fsync_directory(path)
+
+    monkeypatch.setattr(
+        "pa2bridge.mqtt_bridge._fsync_directory",
+        reject_preexisting_ancestor,
+    )
+
+    _save_discovery_topics(
+        state_path,
+        frozenset(
+            {"homeassistant/select/driverack_pa2_host/preset/config"}
+        ),
+    )
+
+    assert forbidden_ancestor not in synced
+
+
+@pytest.mark.parametrize("collision", ["file", "directory", "symlink"])
+def test_unowned_state_directory_marker_collision_fails_closed(
+    tmp_path: Path,
+    collision: str,
+) -> None:
+    directory = tmp_path / "new"
+    marker = _state_directory_marker(directory)
+    if collision == "file":
+        marker.write_text("unrelated", encoding="utf-8")
+    elif collision == "directory":
+        marker.mkdir()
+    else:
+        marker.symlink_to("unrelated")
+
+    with pytest.raises(DiscoveryStateError, match="invalid.*marker"):
+        _save_discovery_topics(
+            directory / "discovery.json",
+            frozenset(
+                {"homeassistant/select/driverack_pa2_host/preset/config"}
+            ),
+        )
+
+    assert not directory.exists()
+    if collision == "file":
+        assert marker.read_text(encoding="utf-8") == "unrelated"
+    elif collision == "directory":
+        assert marker.is_dir()
+    else:
+        assert marker.is_symlink()
+        assert os.readlink(marker) == "unrelated"
+
+
+def test_valid_pending_state_directory_marker_is_recovered(tmp_path: Path) -> None:
+    directory = tmp_path / "new"
+    marker = _state_directory_marker(directory)
+    marker.symlink_to(_marker_payload(directory))
+
+    _save_discovery_topics(
+        directory / "discovery.json",
+        frozenset(
+            {"homeassistant/select/driverack_pa2_host/preset/config"}
+        ),
+    )
+
+    assert directory.is_dir()
+    assert not marker.exists() and not marker.is_symlink()
+
+
+def test_unowned_inner_state_directory_marker_fails_closed(tmp_path: Path) -> None:
+    directory = tmp_path / "new"
+    directory.mkdir()
+    marker = _state_directory_inner_marker(directory)
+    marker.write_text("unrelated", encoding="utf-8")
+
+    with pytest.raises(DiscoveryStateError, match="invalid.*marker"):
+        _save_discovery_topics(
+            directory / "discovery.json",
+            frozenset(
+                {"homeassistant/select/driverack_pa2_host/preset/config"}
+            ),
+        )
+
+    assert marker.read_text(encoding="utf-8") == "unrelated"
+
+
+def test_replaced_parent_marker_is_not_moved_or_deleted(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    directory = tmp_path / "new"
+    marker = _state_directory_marker(directory)
+    original_fsync_directory = _fsync_directory
+    replaced = False
+
+    def replace_after_validation(path: Path) -> None:
+        nonlocal replaced
+        if path == tmp_path and not replaced:
+            replaced = True
+            marker.unlink()
+            marker.write_text("unrelated", encoding="utf-8")
+        original_fsync_directory(path)
+
+    monkeypatch.setattr(
+        "pa2bridge.mqtt_bridge._fsync_directory",
+        replace_after_validation,
+    )
+
+    with pytest.raises(DiscoveryStateError, match="invalid.*marker"):
+        _save_discovery_topics(
+            directory / "discovery.json",
+            frozenset(
+                {"homeassistant/select/driverack_pa2_host/preset/config"}
+            ),
+        )
+
+    assert marker.read_text(encoding="utf-8") == "unrelated"
+    assert not _state_directory_inner_marker(directory).exists()
+
+
+def test_replaced_inner_marker_is_not_deleted(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    directory = tmp_path / "new"
+    directory.mkdir()
+    marker = _state_directory_inner_marker(directory)
+    marker.symlink_to(_marker_payload(directory))
+    original_fsync_directory = _fsync_directory
+    replaced = False
+
+    def replace_after_validation(path: Path) -> None:
+        nonlocal replaced
+        if path == tmp_path and not replaced:
+            replaced = True
+            marker.unlink()
+            marker.write_text("unrelated", encoding="utf-8")
+        original_fsync_directory(path)
+
+    monkeypatch.setattr(
+        "pa2bridge.mqtt_bridge._fsync_directory",
+        replace_after_validation,
+    )
+
+    with pytest.raises(DiscoveryStateError, match="invalid.*marker"):
+        _save_discovery_topics(
+            directory / "discovery.json",
+            frozenset(
+                {"homeassistant/select/driverack_pa2_host/preset/config"}
+            ),
+        )
+
+    assert marker.read_text(encoding="utf-8") == "unrelated"
+
+
+def test_inner_state_directory_marker_is_recovered_after_rename_fsync_failure(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    directory = tmp_path / "new"
+    state_path = directory / "discovery.json"
+    original_fsync_directory = _fsync_directory
+    parent_attempts = 0
+
+    def fail_after_marker_move(path: Path) -> None:
+        nonlocal parent_attempts
+        if path == tmp_path:
+            parent_attempts += 1
+            if parent_attempts == 3:
+                raise OSError("marker move fsync failed")
+        original_fsync_directory(path)
+
+    monkeypatch.setattr(
+        "pa2bridge.mqtt_bridge._fsync_directory",
+        fail_after_marker_move,
+    )
+    topics = frozenset(
+        {"homeassistant/select/driverack_pa2_host/preset/config"}
+    )
+
+    with pytest.raises(DiscoveryStateError, match="marker move fsync failed"):
+        _save_discovery_topics(state_path, topics)
+    inner_marker = _state_directory_inner_marker(directory)
+    assert inner_marker.is_symlink()
+
+    _save_discovery_topics(state_path, topics)
+
+    assert state_path.exists()
+    assert not inner_marker.exists() and not inner_marker.is_symlink()
+
+
+def test_failed_ancestor_directory_fsync_is_retried(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    state_path = tmp_path / "new" / "nested" / "discovery.json"
+    original_fsync_directory = _fsync_directory
+    attempts: list[Path] = []
+    failed = False
+    tmp_path_attempts = 0
+
+    def fail_once(path: Path) -> None:
+        nonlocal failed, tmp_path_attempts
+        attempts.append(path)
+        if path == tmp_path:
+            tmp_path_attempts += 1
+        if path == tmp_path and tmp_path_attempts == 2 and not failed:
+            failed = True
+            raise OSError("ancestor fsync failed")
+        original_fsync_directory(path)
+
+    monkeypatch.setattr(
+        "pa2bridge.mqtt_bridge._fsync_directory",
+        fail_once,
+    )
+    topics = frozenset(
+        {"homeassistant/select/driverack_pa2_host/preset/config"}
+    )
+
+    with pytest.raises(DiscoveryStateError, match="ancestor fsync failed"):
+        _save_discovery_topics(state_path, topics)
+    assert (tmp_path / "new").is_dir()
+    assert list(tmp_path.glob(".pa2bridge-state-dir-*.pending"))
+    attempts.clear()
+    _save_discovery_topics(state_path, topics)
+
+    assert tmp_path in attempts
+    assert not list(tmp_path.glob(".pa2bridge-state-dir-*.pending"))
+
+
+def test_visible_manifest_after_parent_fsync_failure_is_resaved_before_publish(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    state_path = tmp_path / "discovery.json"
+    bridge, _, _, _ = make_bridge(
+        monkeypatch,
+        discovery_state_path=state_path,
+    )
+    bridge._connect_pa2()
+    original_fsync_directory = _fsync_directory
+    failed = False
+
+    def fail_final_parent_fsync(path: Path) -> None:
+        nonlocal failed
+        if path == tmp_path and state_path.exists() and not failed:
+            failed = True
+            raise OSError("final parent fsync failed")
+        original_fsync_directory(path)
+
+    monkeypatch.setattr(
+        "pa2bridge.mqtt_bridge._fsync_directory",
+        fail_final_parent_fsync,
+    )
+    with pytest.raises(DiscoveryStateError, match="final parent fsync failed"):
+        bridge._publish_discovery(bridge.discovery)
+    assert state_path.exists()
+
+    monkeypatch.setattr(
+        "pa2bridge.mqtt_bridge._fsync_directory",
+        original_fsync_directory,
+    )
+    original_save = _save_discovery_topics
+    save_calls = 0
+
+    def record_save(path: Path, topics: frozenset[str]) -> None:
+        nonlocal save_calls
+        save_calls += 1
+        original_save(path, topics)
+
+    monkeypatch.setattr(
+        "pa2bridge.mqtt_bridge._save_discovery_topics",
+        record_save,
+    )
+    retry_bridge, _, _, _ = make_bridge(
+        monkeypatch,
+        discovery_state_path=state_path,
+    )
+    retry_bridge._connect_pa2()
+    retry_bridge._publish_discovery(retry_bridge.discovery)
+
+    assert save_calls == 1
+
+
+def test_directory_fsync_error_precedes_close_error(monkeypatch) -> None:
+    monkeypatch.setattr("pa2bridge.mqtt_bridge.os.open", lambda *args: 12345)
+    monkeypatch.setattr(
+        "pa2bridge.mqtt_bridge.os.fsync",
+        lambda *args: (_ for _ in ()).throw(OSError("fsync-primary")),
+    )
+    monkeypatch.setattr(
+        "pa2bridge.mqtt_bridge.os.close",
+        lambda *args: (_ for _ in ()).throw(OSError("close-secondary")),
+    )
+
+    with pytest.raises(OSError, match="fsync-primary"):
+        _fsync_directory(Path("ignored"))
+
+
+def test_final_state_replace_failure_leaves_durable_pending_superset(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    state_path = tmp_path / "discovery-state.json"
+    old_topic = "homeassistant/select/driverack_pa2_192_0_2_10/preset/config"
+    state_path.write_text(
+        json.dumps({"version": 1, "topics": [old_topic]}) + "\n",
+        encoding="utf-8",
+    )
+    bridge, client, _, _ = make_bridge(
+        monkeypatch,
+        discovery_state_path=state_path,
+    )
+    bridge._connect_pa2()
+    original_replace = os.replace
+    replace_calls = 0
+
+    def fail_second_replace(source, target) -> None:
+        nonlocal replace_calls
+        replace_calls += 1
+        if replace_calls == 2:
+            raise OSError("replace failed")
+        original_replace(source, target)
+
+    monkeypatch.setattr("pa2bridge.mqtt_bridge.os.replace", fail_second_replace)
+
+    with pytest.raises(DiscoveryStateError, match="could not write"):
+        bridge._publish_discovery(bridge.discovery)
+
+    current_topics = {
+        message.topic for message in bridge.discovery if message.payload
+    }
+    assert json.loads(state_path.read_text(encoding="utf-8")) == {
+        "version": 1,
+        "topics": sorted(current_topics | {old_topic}),
+    }
+    assert any(payload for topic, payload, *_ in client.published if topic.endswith("/config"))
+    assert sorted(entry.name for entry in tmp_path.iterdir()) == [state_path.name]
+
+
+def test_discovery_ack_waits_share_one_aggregate_deadline(monkeypatch) -> None:
+    bridge, _, _, _ = make_bridge(monkeypatch)
+    waits: list[float] = []
+
+    def result():
+        return SimpleNamespace(
+            wait_for_publish=lambda timeout: waits.append(timeout),
+            is_published=lambda: True,
+        )
+
+    clock = iter((100.0, 101.0, 103.5, 104.0))
+    monkeypatch.setattr("pa2bridge.mqtt_bridge.time.monotonic", lambda: next(clock))
+
+    bridge._wait_for_discovery_publications(
+        [("one/config", result()), ("two/config", result())],
+        deadline=105.0,
+    )
+
+    assert waits == [5.0, 1.5]
+
+
+def test_discovery_ack_after_aggregate_deadline_is_rejected(monkeypatch) -> None:
+    bridge, _, _, _ = make_bridge(monkeypatch)
+    waits: list[float] = []
+    result = SimpleNamespace(
+        wait_for_publish=lambda timeout: waits.append(timeout),
+        is_published=lambda: True,
+    )
+    clock = iter((100.0, 106.0))
+    monkeypatch.setattr("pa2bridge.mqtt_bridge.time.monotonic", lambda: next(clock))
+
+    with pytest.raises(MqttPublishError, match="timed out"):
+        bridge._wait_for_discovery_publications(
+            [("one/config", result)],
+            deadline=105.0,
+        )
+
+    assert waits == [5.0]
+    assert bridge._mqtt_connected is False
+    assert bridge._stop_event.is_set()
 
 
 def test_poll_reuses_identity_until_the_pa2_connection_generation_changes(monkeypatch) -> None:
@@ -488,7 +1204,10 @@ def test_command_routes_cover_preset_unmute_and_per_channel_mute(monkeypatch) ->
     assert controller.activations == [("2: Alternate", True)]
     assert controller.all_mutes == [False]
     assert controller.channel_mutes == [("high_left", True)]
-    assert client.wait_for_publish_calls == 0
+    discovery_publishes = [
+        item for item in client.published if item[0].endswith("/config")
+    ]
+    assert client.wait_for_publish_calls == len(discovery_publishes)
     last_commands = [payload for topic, payload, *_ in client.published if topic.endswith("last_command")]
     assert last_commands[-1] == "high_left mute verified On"
 
@@ -1502,7 +2221,10 @@ def test_run_forever_uses_paho_background_loop_for_automatic_broker_reconnect(mo
     assert client.loop_started == 1
     assert client.loop_stopped == 1
     assert client.disconnected == 1
-    assert client.wait_for_publish_calls == 2
+    discovery_publishes = [
+        item for item in client.published if item[0].endswith("/config")
+    ]
+    assert client.wait_for_publish_calls == len(discovery_publishes) + 2
     assert pa2.closed == 1
     assert ("driverack/pa2/status", "offline", 1, True) in client.published
 

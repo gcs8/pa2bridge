@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 from contextlib import contextmanager
 from dataclasses import asdict
@@ -19,7 +20,7 @@ from .controller import (
     RecallTimeout,
     TelemetryError,
 )
-from .mqtt_bridge import MqttBridge, MqttPublishError
+from .mqtt_bridge import DiscoveryStateError, MqttBridge, MqttPublishError
 from .protocol import HiQnetClient, ProtocolError
 
 
@@ -91,7 +92,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     commands.add_parser("unmute", help="unmute all six outputs and verify readback")
     commands.add_parser("mute", help="mute all six outputs and verify readback")
-    commands.add_parser("daemon", help="run the Home Assistant MQTT bridge")
+    daemon = commands.add_parser("daemon", help="run the Home Assistant MQTT bridge")
+    configured_state_home = os.environ.get("XDG_STATE_HOME")
+    state_home = Path(configured_state_home) if configured_state_home else None
+    if state_home is None or not state_home.is_absolute():
+        state_home = Path.home() / ".local/state"
+    daemon.add_argument(
+        "--discovery-state",
+        type=Path,
+        default=state_home / "pa2bridge/discovery.json",
+        help="durable MQTT discovery topic state",
+    )
     return parser
 
 
@@ -104,7 +115,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         config = load_config(args.config)
         if args.command == "daemon":
-            MqttBridge(config).run_forever()
+            MqttBridge(
+                config,
+                discovery_state_path=args.discovery_state,
+            ).run_forever()
             return 0
 
         with connected_controller(config) as controller:
@@ -132,6 +146,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     except (
         ConfigError,
+        DiscoveryStateError,
         MqttPublishError,
         OutputVerificationError,
         ProtocolError,

@@ -6,7 +6,8 @@ After=network-online.target
 [Service]
 Type=simple
 EnvironmentFile=%h/.config/pa2bridge/pa2bridge.env
-ExecStart=%h/.local/bin/pa2bridge --config %h/.config/pa2bridge/config.toml daemon
+ExecStart=%h/.local/bin/pa2bridge --config %h/.config/pa2bridge/config.toml daemon --discovery-state %S/pa2bridge/discovery.json
+StateDirectory=pa2bridge
 Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=75s

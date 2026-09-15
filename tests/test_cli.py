@@ -4,7 +4,10 @@ import importlib
 import json
 import sys
 from contextlib import contextmanager
+from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 from pa2bridge import cli
 from pa2bridge.controller import DeviceIdentity, Pa2State, Preset, TelemetryError
@@ -117,6 +120,25 @@ def test_mute_uses_verified_controller_operation(monkeypatch, capsys) -> None:
     }
 
 
+@pytest.mark.parametrize("xdg_state_home", ["", "relative/state"])
+def test_daemon_ignores_invalid_xdg_state_home(monkeypatch, xdg_state_home) -> None:
+    monkeypatch.setenv("XDG_STATE_HOME", xdg_state_home)
+
+    args = cli.build_parser().parse_args(["daemon"])
+
+    assert args.discovery_state == (
+        Path.home() / ".local/state/pa2bridge/discovery.json"
+    )
+
+
+def test_daemon_uses_absolute_xdg_state_home(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+
+    args = cli.build_parser().parse_args(["daemon"])
+
+    assert args.discovery_state == tmp_path / "pa2bridge/discovery.json"
+
+
 def test_telemetry_error_uses_the_cli_json_error_contract(monkeypatch, capsys) -> None:
     fake = FakeController()
 
@@ -133,10 +155,15 @@ def test_telemetry_error_uses_the_cli_json_error_contract(monkeypatch, capsys) -
     assert error == {"error": "invalid device telemetry", "verified": False}
 
 
-def test_mqtt_publish_error_uses_the_cli_json_error_contract(monkeypatch, capsys) -> None:
+def test_mqtt_publish_error_uses_the_cli_json_error_contract(
+    monkeypatch, capsys, tmp_path
+) -> None:
+    state_path = tmp_path / "discovery.json"
+
     class FailedBridge:
-        def __init__(self, config) -> None:
+        def __init__(self, config, **kwargs) -> None:
             del config
+            assert kwargs == {"discovery_state_path": state_path}
 
         def run_forever(self) -> None:
             raise MqttPublishError("broker rejected publication")
@@ -144,7 +171,15 @@ def test_mqtt_publish_error_uses_the_cli_json_error_contract(monkeypatch, capsys
     monkeypatch.setattr(cli, "load_config", lambda path: SimpleNamespace())
     monkeypatch.setattr(cli, "MqttBridge", FailedBridge)
 
-    assert cli.main(["--config", "ignored.toml", "daemon"]) == 2
+    assert cli.main(
+        [
+            "--config",
+            "ignored.toml",
+            "daemon",
+            "--discovery-state",
+            str(state_path),
+        ]
+    ) == 2
 
     error = json.loads(capsys.readouterr().err.splitlines()[-1])
     assert error == {"error": "broker rejected publication", "verified": False}
