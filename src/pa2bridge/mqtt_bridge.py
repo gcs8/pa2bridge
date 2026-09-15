@@ -668,7 +668,6 @@ class MqttBridge:
                     reconnected
                     or not self._details_valid
                     or preset_changed
-                    or refresh_overdue
                 )
                 if invalidate_details:
                     self._details_valid = False

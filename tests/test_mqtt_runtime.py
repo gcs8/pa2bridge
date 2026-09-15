@@ -1049,7 +1049,7 @@ def test_observed_preset_change_refreshes_crossover_details(monkeypatch) -> None
     assert offline_index < preset_index < crossover_index < online_index
 
 
-def test_periodic_detail_refresh_marks_details_offline_before_refresh(monkeypatch) -> None:
+def test_periodic_detail_refresh_keeps_valid_details_online(monkeypatch) -> None:
     bridge, client, pa2, _ = make_bridge(monkeypatch)
     pa2.connected = True
     bridge._discovery_published = True
@@ -1061,14 +1061,37 @@ def test_periodic_detail_refresh_marks_details_offline_before_refresh(monkeypatc
     bridge._poll_once()
 
     events = [(topic, payload) for topic, payload, *_ in client.published]
-    offline_index = events.index(("driverack/pa2/status/details", "offline"))
     crossover_index = next(
         index
         for index, (topic, _) in enumerate(events)
         if topic == "driverack/pa2/state/crossover"
     )
     online_index = events.index(("driverack/pa2/status/details", "online"))
-    assert offline_index < crossover_index < online_index
+    assert ("driverack/pa2/status/details", "offline") not in events
+    assert crossover_index < online_index
+
+
+def test_failed_periodic_detail_refresh_marks_details_offline_once(monkeypatch) -> None:
+    bridge, client, pa2, controller = make_bridge(monkeypatch)
+    pa2.connected = True
+    bridge._discovery_published = True
+
+    bridge._poll_once()
+    client.published.clear()
+    bridge._last_detail_refresh = float("-inf")
+
+    def invalid_crossover():
+        raise OSError("crossover unavailable")
+
+    controller.crossover = invalid_crossover
+    bridge._poll_once()
+
+    assert [
+        payload
+        for topic, payload, *_ in client.published
+        if topic == "driverack/pa2/status/details"
+    ] == ["offline"]
+    assert bridge._details_valid is False
 
 
 def test_detail_refresh_republishes_discovery_when_allowed_preset_labels_change(
