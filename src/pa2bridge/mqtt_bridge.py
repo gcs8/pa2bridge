@@ -966,9 +966,12 @@ class MqttBridge:
                             state,
                             deadline=post_command_deadline,
                         )
-                        result = (
-                            f"recalled {state.current_preset.label}; outputs verified unmuted"
+                        output_result = (
+                            "outputs verified unmuted"
+                            if state.all_outputs_unmuted
+                            else "output mute state preserved"
                         )
+                        result = f"recalled {state.current_preset.label}; {output_result}"
                         refresh_details = True
                     elif command.topic == f"{base}/command/unmute":
                         device_touched = True

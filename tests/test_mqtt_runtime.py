@@ -481,6 +481,47 @@ def test_command_routes_cover_preset_unmute_and_per_channel_mute(monkeypatch) ->
     assert last_commands[-1] == "high_left mute verified On"
 
 
+def test_active_preset_command_reports_preserved_mute_state(monkeypatch) -> None:
+    bridge, client, _, controller = make_bridge(monkeypatch)
+    controller.state_value = Pa2State(
+        controller.identity_value,
+        controller.presets[0],
+        {**controller.state_value.output_mutes, "high_left": True},
+    )
+
+    bridge._on_message(
+        None,
+        None,
+        message("driverack/pa2/command/preset", "1: Flat"),
+    )
+    assert bridge._process_queued_command() is True
+
+    last_commands = [
+        payload
+        for topic, payload, *_ in client.published
+        if topic.endswith("last_command")
+    ]
+    assert last_commands[-1] == "recalled 1: Flat; output mute state preserved"
+
+
+def test_preset_command_reports_verified_unmuted_state(monkeypatch) -> None:
+    bridge, client, _, _ = make_bridge(monkeypatch)
+
+    bridge._on_message(
+        None,
+        None,
+        message("driverack/pa2/command/preset", "1: Flat"),
+    )
+    assert bridge._process_queued_command() is True
+
+    last_commands = [
+        payload
+        for topic, payload, *_ in client.published
+        if topic.endswith("last_command")
+    ]
+    assert last_commands[-1] == "recalled 1: Flat; outputs verified unmuted"
+
+
 def test_command_queued_before_disconnect_is_discarded_and_pa2_closed(monkeypatch) -> None:
     bridge, client, pa2, controller = make_bridge(monkeypatch)
     bridge._on_message(

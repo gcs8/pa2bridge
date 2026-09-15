@@ -300,6 +300,36 @@ def test_activate_preset_waits_for_recall_then_unmutes_and_verifies_every_output
     assert 0.75 in clock.sleeps
 
 
+@pytest.mark.parametrize("unmute_after", [False, True])
+def test_activate_already_active_preset_preserves_output_state(unmute_after: bool) -> None:
+    client = FakeClient(current=1)
+    client.mutes[OUTPUT_MUTES["high_left"]] = "Off"
+    controller = Pa2Controller(
+        client,
+        allowed_slots=(1, 2),
+        post_recall_delay=0,
+    )
+    identity = DeviceIdentity("dbxDriveRackPA2", "Cached PA2", "1.2.0.1")
+
+    state = controller.activate_preset(
+        1,
+        unmute_after=unmute_after,
+        identity=identity,
+    )
+
+    assert client.sets == []
+    assert state.identity is identity
+    assert state.current_preset.slot == 1
+    assert state.output_mutes == {
+        "high_left": False,
+        "high_right": True,
+        "mid_left": True,
+        "mid_right": True,
+        "low_left": True,
+        "low_right": True,
+    }
+
+
 def test_all_output_writes_are_individually_verified_and_paced() -> None:
     class OrderedClient(FakeClient):
         def __init__(self) -> None:
@@ -552,19 +582,18 @@ def test_already_active_target_still_uses_absolute_activation_deadline() -> None
 
     clock = DeadlineClock()
 
-    class SlowFinalPresetReadClient(FakeClient):
+    class SlowNoopStateClient(FakeClient):
         def __init__(self) -> None:
             super().__init__(current=2)
-            self.current_reads = 0
+            self.expired = False
 
         def get(self, path: Iterable[str]) -> str:
-            if tuple(path) == CURRENT_PRESET:
-                self.current_reads += 1
-                if self.current_reads == 2:
-                    clock.now = 2.0
+            if tuple(path) in OUTPUT_MUTES.values() and not self.expired:
+                self.expired = True
+                clock.now = 2.0
             return super().get(path)
 
-    client = SlowFinalPresetReadClient()
+    client = SlowNoopStateClient()
     controller = Pa2Controller(
         client,
         allowed_slots=(1, 2),
@@ -574,10 +603,10 @@ def test_already_active_target_still_uses_absolute_activation_deadline() -> None
         monotonic=clock.monotonic,
     )
 
-    with pytest.raises(OutputVerificationError, match="rollback deadline expired"):
+    with pytest.raises(RecallTimeout, match="deadline expired"):
         controller.activate_preset(2)
 
-    assert not any(value == "Off" for _, value in client.sets)
+    assert client.sets == []
 
 
 def test_post_recall_output_reread_must_confirm_all_six_muted_before_unmute() -> None:
@@ -982,7 +1011,7 @@ def test_activation_rejects_catalog_parsed_after_recall_deadline() -> None:
     )
 
     with pytest.raises(RollbackDeadlineError, match="unsafe or unknown"):
-        controller.activate_preset(1)
+        controller.activate_preset(2)
 
     assert all(value == "On" for value in client.mutes.values())
     assert not any(value == "Off" for _, value in client.sets)
@@ -1058,7 +1087,7 @@ def test_activation_propagates_one_deadline_through_the_entire_transaction() -> 
         monotonic=clock.monotonic,
     )
 
-    controller.activate_preset(1)
+    controller.activate_preset(2)
 
     assert {kind for kind, _ in client.deadlines} == {"get", "set", "ls"}
     assert {deadline for _, deadline in client.deadlines} == {1.0}
