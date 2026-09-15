@@ -504,7 +504,7 @@ def _load_discovery_topics(path: Path | None) -> frozenset[str]:
     return frozenset(validated)
 
 
-def _load_identity_state(path: Path | None) -> tuple[str, str] | None:
+def _load_identity_state(path: Path | None) -> tuple[str, str | None] | None:
     if path is None:
         return None
     descriptor: int | None = None
@@ -545,12 +545,17 @@ def _load_identity_state(path: Path | None) -> tuple[str, str] | None:
         raise DiscoveryStateError("identity state has an unsupported version")
     try:
         host = _normalize_identity_host(value["host"])
-        mac_address = normalize_mac_address(
-            value["mac_address"], description="persisted PA2 MAC address"
+        raw_mac_address = value["mac_address"]
+        mac_address = (
+            None
+            if raw_mac_address is None
+            else normalize_mac_address(
+                raw_mac_address, description="persisted PA2 MAC address"
+            )
         )
     except (ConfigError, ValueError, TypeError) as error:
         raise DiscoveryStateError("identity state has invalid values") from error
-    if mac_address is None:
+    if value["mac_address"] is not None and mac_address is None:
         raise DiscoveryStateError("identity state has invalid values")
     return host, mac_address
 
@@ -743,15 +748,19 @@ def _save_discovery_topics(path: Path, topics: frozenset[str]) -> None:
     _save_state_payload(path, payload, description="discovery state")
 
 
-def _save_identity_state(path: Path, host: str, mac_address: str) -> None:
+def _save_identity_state(path: Path, host: str, mac_address: str | None) -> None:
     try:
         normalized_host = _normalize_identity_host(host)
-        normalized_mac = normalize_mac_address(
-            mac_address, description="persisted PA2 MAC address"
+        normalized_mac = (
+            None
+            if mac_address is None
+            else normalize_mac_address(
+                mac_address, description="persisted PA2 MAC address"
+            )
         )
     except (ConfigError, ValueError, TypeError) as error:
         raise DiscoveryStateError("identity state has invalid values") from error
-    if normalized_mac is None:
+    if mac_address is not None and normalized_mac is None:
         raise DiscoveryStateError("identity state has invalid values")
     payload = (
         json.dumps(
@@ -1531,31 +1540,41 @@ class MqttBridge:
             else None
         )
         peer_ipv4 = getattr(self.pa2_client, "peer_ipv4", None)
-        discovered: str | None = None
+        local_discovered: str | None = None
+        trusted_discovered: str | None = None
         source: str | None = None
         if deadline is not None and time.monotonic() >= deadline:
             raise DiscoveryStateError("PA2 peer validation deadline expired")
         if peer_ipv4 is not None:
-            discovered = _discover_mac_address(peer_ipv4)
-            source = "local network"
-        if (
-            peer_ipv4 is not None
-            and discovered is None
-            and self._home_assistant_token is not None
-        ):
+            local_discovered = _discover_mac_address(peer_ipv4)
+        if peer_ipv4 is not None and self._home_assistant_token is not None:
             timeout = 3.0
             if deadline is not None:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise DiscoveryStateError("PA2 peer validation deadline expired")
                 timeout = min(timeout, remaining)
-            discovered = _discover_mac_address_from_home_assistant(
+            trusted_discovered = _discover_mac_address_from_home_assistant(
                 peer_ipv4,
                 self._home_assistant_token,
                 timeout=timeout,
                 deadline=deadline,
             )
-            source = "Home Assistant network data"
+        if (
+            local_discovered is not None
+            and trusted_discovered is not None
+            and local_discovered != trusted_discovered
+        ):
+            raise DiscoveryStateError(
+                "local neighbour MAC conflicts with trusted Home Assistant network data"
+            )
+        discovered = trusted_discovered
+        if discovered is not None:
+            source = (
+                "local and Home Assistant network data"
+                if local_discovered == discovered
+                else "Home Assistant network data"
+            )
 
         if configured_mac is not None:
             if discovered is not None and configured_mac != discovered:
@@ -1569,6 +1588,14 @@ class MqttBridge:
             ):
                 raise DiscoveryStateError(
                     "configured PA2 MAC conflicts with persisted identity state"
+                )
+            if (
+                persisted_mac is not None
+                and configured_mac != persisted_mac
+                and configured_mac not in {local_discovered, trusted_discovered}
+            ):
+                raise IdentityRevalidationUnavailable(
+                    "replacement PA2 MAC could not be confirmed by live network data"
                 )
             if persisted_mac is not None and configured_mac != persisted_mac:
                 LOGGER.warning(
@@ -1595,7 +1622,7 @@ class MqttBridge:
                     "discovered PA2 MAC from %s for stable MQTT identity",
                     source,
                 )
-        elif self._stable_mac_address is not None or persisted_mac is not None:
+        elif self._stable_mac_address is not None or self._persisted_identity is not None:
             raise IdentityRevalidationUnavailable(
                 "the connected PA2 peer MAC could not be revalidated"
             )
@@ -1610,6 +1637,13 @@ class MqttBridge:
                 )
             mac_address = None
             self._address_only_connection_generation = current_generation
+            if self.identity_state_path is not None:
+                persisted_host = peer_ipv4 or self.config.pa2.host
+                _save_identity_state(self.identity_state_path, persisted_host, None)
+                self._persisted_identity = (
+                    _normalize_identity_host(persisted_host),
+                    None,
+                )
             LOGGER.warning(
                 "PA2 MAC was not found for %s; using address-based MQTT identity. "
                 "Any later physical connection will be refused until a stable MAC is "

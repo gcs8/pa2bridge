@@ -1,8 +1,9 @@
 # PA2 connection
 [pa2]
 host = "192.0.2.20"
-# Optional override. PA2Bridge normally discovers this from the configured address.
-# mac_address = "02:00:5e:10:00:01"
+# Required for a restart-safe standalone daemon. Automatic discovery needs the
+# Home Assistant App's trusted UniFi tracker correlation and is not available here.
+mac_address = "02:00:5e:10:00:01"
 # Set with mac_address only while deliberately replacing the physical PA2.
 # replace_saved_identity = true
 port = 19272
