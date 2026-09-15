@@ -52,6 +52,16 @@ class FakeRawPa2Client:
         self.connected = True
         self.connection_generation += 1
 
+    def connect_before(
+        self,
+        username: str,
+        password: str,
+        *,
+        deadline: float,
+    ) -> None:
+        del deadline
+        self.connect(username, password)
+
     def close(self) -> None:
         self.connected = False
 

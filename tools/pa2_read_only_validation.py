@@ -42,6 +42,14 @@ class RawPa2Client(Protocol):
 
     def connect(self, username: str, password: str) -> None: ...
 
+    def connect_before(
+        self,
+        username: str,
+        password: str,
+        *,
+        deadline: float,
+    ) -> None: ...
+
     def close(self) -> None: ...
 
     def get(self, path: Iterable[str]) -> str: ...
@@ -164,6 +172,21 @@ class ReadOnlyPa2Client:
         self._connection_attempted = True
         self._reserve("connect")
         self._client.connect(username, password)
+
+    def connect_before(
+        self,
+        username: str,
+        password: str,
+        *,
+        deadline: float,
+    ) -> None:
+        if self._connection_attempted:
+            raise ValidationSafetyError(
+                "second connection attempt is forbidden during read-only validation"
+            )
+        self._connection_attempted = True
+        self._reserve("connect")
+        self._client.connect_before(username, password, deadline=deadline)
 
     def close(self) -> None:
         self._client.close()
