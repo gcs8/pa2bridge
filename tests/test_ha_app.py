@@ -452,7 +452,7 @@ def test_home_assistant_app_metadata_is_bounded_and_requires_mqtt() -> None:
     assert 'pa2_mac_address: ""' in config
     assert "pa2_mac_address: str" in config
     assert 'allowed_preset_slots:\n    - "int(1,100)?"' in config
-    assert 'breaking_versions:\n  - "0.1.2"' in config
+    assert 'breaking_versions:\n  - "0.1.2"\n  - "0.1.9"' in config
     assert '- "int(1,2)"' not in config
     assert 'pa2_password: "password?"' not in config
     assert "host_network:" not in config

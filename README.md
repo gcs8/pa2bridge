@@ -214,6 +214,8 @@ The first validated automatic match is saved in `/data/identity.json`. Without a
 
 On the first 0.1.9 start with a validated MAC, every MQTT entity unique ID changes from the old address-derived identifier to the stable MAC-derived identifier. PA2Bridge removes the old retained discovery records before publishing the replacements, so Home Assistant normally reuses unchanged entity IDs. Registry customizations do not transfer between unique IDs, however. After that first successful start, check the PA2 device page and restore any area assignments, icons, custom names, dashboard or automation references, and Stream Deck bindings that Home Assistant did not retain.
 
+Supervisor treats 0.1.9 as a breaking App version and will not cross it through automatic update. Record those bindings first, then run the update manually.
+
 To replace the physical PA2, enter the new unit's MAC and turn on **Replace saved PA2 identity**. Start the app and wait for it to report that discovery was published. PA2Bridge then removes the discovery topics it previously owned and publishes the new identity. Turn the replacement option off afterward. A live MAC that disagrees with the entered value still stops startup.
 
 ## Stream Deck
