@@ -16,6 +16,7 @@ from pa2bridge.controller import (
     RollbackDeadlineError,
     TelemetryError,
 )
+from pa2bridge.protocol import HiQnetClient, ProtocolStartDeadlineExpired
 
 
 PRESET_ROOT = ("Storage", "Presets", "SV")
@@ -33,6 +34,7 @@ class FakeClient:
         self.mutes = {path: "On" for path in OUTPUT_MUTES.values()}
         self.bad_verify_path: tuple[str, ...] | None = None
         self.reconnects = 0
+        self.read_deadlines: list[float] = []
 
     def get(self, path: Iterable[str]) -> str:
         path = tuple(path)
@@ -73,7 +75,7 @@ class FakeClient:
         self.reconnects += 1
 
     def get_before(self, path: Iterable[str], *, deadline: float) -> str:
-        del deadline
+        self.read_deadlines.append(deadline)
         return self.get(path)
 
     def set_before(
@@ -86,13 +88,24 @@ class FakeClient:
         del deadline
         self.set(path, value)
 
+    def set_starting_before(
+        self,
+        path: Iterable[str],
+        value: str,
+        *,
+        start_deadline: float,
+        deadline: float,
+    ) -> None:
+        del deadline
+        self.set_before(path, value, deadline=start_deadline)
+
     def ls_before(
         self,
         path: Iterable[str],
         *,
         deadline: float,
     ) -> dict[str, str]:
-        del deadline
+        self.read_deadlines.append(deadline)
         return self.ls(path)
 
     def reconnect_before(self, *, deadline: float) -> None:
@@ -297,6 +310,36 @@ def test_activate_preset_waits_for_recall_then_unmutes_and_verifies_every_output
     assert state.current_preset.slot == 2
     assert state.all_outputs_unmuted is True
     assert 0.75 in clock.sleeps
+
+
+@pytest.mark.parametrize("unmute_after", [False, True])
+def test_activate_already_active_preset_preserves_output_state(unmute_after: bool) -> None:
+    client = FakeClient(current=1)
+    client.mutes[OUTPUT_MUTES["high_left"]] = "Off"
+    controller = Pa2Controller(
+        client,
+        allowed_slots=(1, 2),
+        post_recall_delay=0,
+    )
+    identity = DeviceIdentity("dbxDriveRackPA2", "Cached PA2", "1.2.0.1")
+
+    state = controller.activate_preset(
+        1,
+        unmute_after=unmute_after,
+        identity=identity,
+    )
+
+    assert client.sets == []
+    assert state.identity is identity
+    assert state.current_preset.slot == 1
+    assert state.output_mutes == {
+        "high_left": False,
+        "high_right": True,
+        "mid_left": True,
+        "mid_right": True,
+        "low_left": True,
+        "low_right": True,
+    }
 
 
 def test_all_output_writes_are_individually_verified_and_paced() -> None:
@@ -551,19 +594,18 @@ def test_already_active_target_still_uses_absolute_activation_deadline() -> None
 
     clock = DeadlineClock()
 
-    class SlowFinalPresetReadClient(FakeClient):
+    class SlowNoopStateClient(FakeClient):
         def __init__(self) -> None:
             super().__init__(current=2)
-            self.current_reads = 0
+            self.expired = False
 
         def get(self, path: Iterable[str]) -> str:
-            if tuple(path) == CURRENT_PRESET:
-                self.current_reads += 1
-                if self.current_reads == 2:
-                    clock.now = 2.0
+            if tuple(path) in OUTPUT_MUTES.values() and not self.expired:
+                self.expired = True
+                clock.now = 2.0
             return super().get(path)
 
-    client = SlowFinalPresetReadClient()
+    client = SlowNoopStateClient()
     controller = Pa2Controller(
         client,
         allowed_slots=(1, 2),
@@ -573,10 +615,10 @@ def test_already_active_target_still_uses_absolute_activation_deadline() -> None
         monotonic=clock.monotonic,
     )
 
-    with pytest.raises(OutputVerificationError, match="rollback deadline expired"):
+    with pytest.raises(RecallTimeout, match="deadline expired"):
         controller.activate_preset(2)
 
-    assert not any(value == "Off" for _, value in client.sets)
+    assert client.sets == []
 
 
 def test_post_recall_output_reread_must_confirm_all_six_muted_before_unmute() -> None:
@@ -949,6 +991,236 @@ def test_public_unmute_propagates_one_deadline_to_protocol_operations() -> None:
     assert {deadline for _, deadline in client.deadlines} == {1.0}
 
 
+@pytest.mark.parametrize("muted", [False, True])
+@pytest.mark.parametrize("single_channel", [False, True])
+def test_public_output_command_checks_deadline_at_first_protocol_write(
+    single_channel: bool,
+    muted: bool,
+) -> None:
+    clock = Clock()
+    clock.monotonic = lambda: clock.now
+
+    class DeadlineAwareClient(FakeClient):
+        def __init__(self) -> None:
+            super().__init__(current=1)
+            self.set_deadlines: list[float] = []
+
+        def set_before(
+            self,
+            path: Iterable[str],
+            value: str,
+            *,
+            deadline: float,
+        ) -> None:
+            self.set_deadlines.append(deadline)
+            super().set(path, value)
+
+    client = DeadlineAwareClient()
+    controller = Pa2Controller(
+        client,
+        allowed_slots=(1, 2),
+        recall_timeout=1.0,
+        monotonic=clock.monotonic,
+    )
+
+    if single_channel:
+        controller.set_output_muted("high_left", muted, start_deadline=0.5)
+    else:
+        controller.set_all_outputs_muted(muted, start_deadline=0.5)
+
+    assert client.set_deadlines[0] == 0.5
+    assert set(client.set_deadlines[1:]) <= {1.0}
+
+
+def test_activation_checks_command_deadline_at_preflight_and_first_write() -> None:
+    clock = Clock()
+    clock.monotonic = lambda: clock.now
+
+    class DeadlineAwareClient(FakeClient):
+        def __init__(self) -> None:
+            super().__init__(current=1)
+            self.deadlines: list[tuple[str, float]] = []
+
+        def get_before(self, path: Iterable[str], *, deadline: float) -> str:
+            self.deadlines.append(("get", deadline))
+            return self.get(path)
+
+        def set_before(
+            self,
+            path: Iterable[str],
+            value: str,
+            *,
+            deadline: float,
+        ) -> None:
+            self.deadlines.append(("set", deadline))
+            self.set(path, value)
+
+        def ls_before(
+            self,
+            path: Iterable[str],
+            *,
+            deadline: float,
+        ) -> dict[str, str]:
+            self.deadlines.append(("ls", deadline))
+            return self.ls(path)
+
+    client = DeadlineAwareClient()
+    controller = Pa2Controller(
+        client,
+        allowed_slots=(1, 2),
+        recall_timeout=1.0,
+        post_recall_delay=0.0,
+        monotonic=clock.monotonic,
+    )
+
+    controller.activate_preset(2, start_deadline=0.5)
+
+    first_set = next(index for index, item in enumerate(client.deadlines) if item[0] == "set")
+    assert {deadline for _, deadline in client.deadlines[: first_set + 1]} == {0.5}
+    assert {deadline for _, deadline in client.deadlines[first_set + 1 :]} <= {1.0}
+
+
+def test_already_active_preset_reads_use_command_start_deadline() -> None:
+    class DeadlineAwareClient(FakeClient):
+        def __init__(self) -> None:
+            super().__init__(current=1)
+            self.deadlines: list[float] = []
+
+        def get_before(self, path: Iterable[str], *, deadline: float) -> str:
+            self.deadlines.append(deadline)
+            return self.get(path)
+
+        def ls_before(
+            self,
+            path: Iterable[str],
+            *,
+            deadline: float,
+        ) -> dict[str, str]:
+            self.deadlines.append(deadline)
+            return self.ls(path)
+
+    client = DeadlineAwareClient()
+    controller = Pa2Controller(
+        client,
+        allowed_slots=(1, 2),
+        recall_timeout=1.0,
+        post_recall_delay=0.0,
+        monotonic=lambda: 0.0,
+    )
+
+    state = controller.activate_preset(1, start_deadline=0.5)
+
+    assert state.current_preset.slot == 1
+    assert client.sets == []
+    assert client.deadlines
+    assert set(client.deadlines) == {0.5}
+
+
+@pytest.mark.parametrize("operation", ["preset", "all", "single"])
+def test_expired_command_before_first_write_does_not_trigger_rollback(
+    operation: str,
+) -> None:
+    class ExpiredFirstWriteClient(FakeClient):
+        def __init__(self) -> None:
+            super().__init__(current=1)
+            self.start_attempts = 0
+
+        def set_starting_before(
+            self,
+            path: Iterable[str],
+            value: str,
+            *,
+            start_deadline: float,
+            deadline: float,
+        ) -> None:
+            del path, value, start_deadline, deadline
+            self.start_attempts += 1
+            raise ProtocolStartDeadlineExpired(
+                "command expired before its first PA2 actuator write"
+            )
+
+    client = ExpiredFirstWriteClient()
+    controller = Pa2Controller(
+        client,
+        allowed_slots=(1, 2),
+        recall_timeout=1.0,
+        post_recall_delay=0.0,
+        monotonic=lambda: 0.0,
+    )
+
+    with pytest.raises(ProtocolStartDeadlineExpired):
+        if operation == "preset":
+            controller.activate_preset(2, start_deadline=0.5)
+        elif operation == "all":
+            controller.set_all_outputs_muted(True, start_deadline=0.5)
+        else:
+            controller.set_output_muted("high_left", True, start_deadline=0.5)
+
+    assert client.start_attempts == 1
+    assert client.sets == []
+
+
+@pytest.mark.parametrize("muted", [False, True])
+@pytest.mark.parametrize("single_channel", [False, True])
+def test_real_pre_send_expiry_never_enters_output_rollback(
+    monkeypatch,
+    single_channel: bool,
+    muted: bool,
+) -> None:
+    class RecordingSocket:
+        def __init__(self) -> None:
+            self.sent: list[bytes] = []
+
+        def sendall(self, data: bytes) -> None:
+            self.sent.append(data)
+
+        def shutdown(self, how: int) -> None:
+            del how
+
+        def close(self) -> None:
+            pass
+
+    class BoundaryClient(FakeClient):
+        def __init__(self) -> None:
+            super().__init__(current=1)
+            self.socket = RecordingSocket()
+            self.protocol = HiQnetClient("127.0.0.1", timeout=10)
+            self.protocol._socket = self.socket
+
+        def set_starting_before(
+            self,
+            path: Iterable[str],
+            value: str,
+            *,
+            start_deadline: float,
+            deadline: float,
+        ) -> None:
+            self.protocol.set_starting_before(
+                path,
+                value,
+                start_deadline=start_deadline,
+                deadline=deadline,
+            )
+
+    client = BoundaryClient()
+    controller = Pa2Controller(
+        client,
+        allowed_slots=(1, 2),
+        recall_timeout=1.0,
+        monotonic=lambda: 0.0,
+    )
+    monkeypatch.setattr("pa2bridge.protocol.time.monotonic", lambda: 2.0)
+
+    with pytest.raises(ProtocolStartDeadlineExpired):
+        if single_channel:
+            controller.set_output_muted("high_left", muted, start_deadline=0.5)
+        else:
+            controller.set_all_outputs_muted(muted, start_deadline=0.5)
+
+    assert client.socket.sent == []
+    assert client.sets == []
+
+
 def test_activation_rejects_catalog_parsed_after_recall_deadline() -> None:
     clock = Clock()
     clock.monotonic = lambda: clock.now
@@ -981,7 +1253,7 @@ def test_activation_rejects_catalog_parsed_after_recall_deadline() -> None:
     )
 
     with pytest.raises(RollbackDeadlineError, match="unsafe or unknown"):
-        controller.activate_preset(1)
+        controller.activate_preset(2)
 
     assert all(value == "On" for value in client.mutes.values())
     assert not any(value == "Off" for _, value in client.sets)
@@ -1057,7 +1329,7 @@ def test_activation_propagates_one_deadline_through_the_entire_transaction() -> 
         monotonic=clock.monotonic,
     )
 
-    controller.activate_preset(1)
+    controller.activate_preset(2)
 
     assert {kind for kind, _ in client.deadlines} == {"get", "set", "ls"}
     assert {deadline for _, deadline in client.deadlines} == {1.0}
@@ -1627,6 +1899,22 @@ class TelemetryClient(FakeClient):
         if key == ("Preset", "Crossover", "SV"):
             return dict(self.crossover_sv)
         return super().ls(key)
+
+
+def test_read_only_snapshot_methods_share_the_callers_absolute_deadline() -> None:
+    client = TelemetryClient()
+    controller = Pa2Controller(client, allowed_slots=(1, 2))
+    deadline = 1_000_000_000_000.0
+
+    identity = controller.identity(deadline=deadline)
+    controller.list_all_presets(deadline=deadline)
+    controller.state(identity=identity, deadline=deadline)
+    controller.input_meters(deadline=deadline)
+    controller.output_levels(deadline=deadline)
+    controller.crossover(deadline=deadline)
+
+    assert client.read_deadlines
+    assert set(client.read_deadlines) == {deadline}
 
 
 def test_read_only_telemetry_exposes_full_inventory_input_and_output_meters() -> None:
