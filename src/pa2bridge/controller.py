@@ -370,6 +370,30 @@ class Pa2Controller:
             outputs_touched = False
             try:
                 preset = self._resolve_preset(target, deadline=deadline)
+                current = _parse_unsigned_integer(
+                    "CurrentPreset",
+                    self._client_get(CURRENT_PRESET, deadline=deadline),
+                    minimum=1,
+                )
+                self._require_unmute_before(deadline)
+                if current == preset.slot:
+                    if identity is None:
+                        identity = DeviceIdentity(
+                            class_name=self._client_get(
+                                ("Node", "AT", "Class_Name"), deadline=deadline
+                            ),
+                            instance_name=self._client_get(
+                                ("Node", "AT", "Instance_Name"), deadline=deadline
+                            ),
+                            firmware=self._client_get(
+                                ("Node", "AT", "Software_Version"), deadline=deadline
+                            ),
+                        )
+                    return Pa2State(
+                        identity=identity,
+                        current_preset=preset,
+                        output_mutes=self._read_all_output_mutes(deadline=deadline),
+                    )
                 outputs_touched = True
                 return self._activate_resolved_preset(
                     preset,
