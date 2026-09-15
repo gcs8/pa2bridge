@@ -2,6 +2,12 @@ configuration:
   pa2_host:
     name: DriveRack PA2 host
     description: IPv4 address or resolvable hostname of the PA2.
+  pa2_mac_address:
+    name: DriveRack PA2 MAC address (optional)
+    description: Leave blank for automatic discovery. Enter a MAC only when automatic discovery is unavailable.
+  replace_saved_identity:
+    name: Replace saved PA2 identity
+    description: Leave off normally. Turn on with the new PA2 MAC only when deliberately replacing the physical unit, then turn it off after the app connects.
   pa2_port:
     name: DriveRack PA2 port
     description: HiQnet Console TCP port, normally 19272.

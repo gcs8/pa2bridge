@@ -337,9 +337,11 @@ def test_connection_generation_changes_only_after_successful_authentication() ->
     with fake_pa2() as ((host, port), _):
         client = HiQnetClient(host, port=port, timeout=1)
         assert client.connection_generation == 0
+        assert client.peer_ipv4 is None
 
         client.connect()
         assert client.connection_generation == 1
+        assert client.peer_ipv4 == host
 
         client.reconnect()
         assert client.connection_generation == 2
@@ -347,6 +349,7 @@ def test_connection_generation_changes_only_after_successful_authentication() ->
         with pytest.raises(AuthenticationError):
             client.connect("different-user", "administrator")
         assert client.connection_generation == 2
+        assert client.peer_ipv4 is None
 
 
 def test_reconnect_authentication_rejection_forgets_stale_credentials(monkeypatch) -> None:

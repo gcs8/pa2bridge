@@ -1,5 +1,5 @@
 name: PA2Bridge
-version: "0.1.8"
+version: "0.1.9"
 slug: pa2bridge
 description: Safely control and monitor a dbx DriveRack PA2 through Home Assistant
 url: "https://github.com/gcs8/pa2bridge/tree/main/pa2bridge"
@@ -7,14 +7,18 @@ arch:
   - amd64
   - aarch64
 init: false
+homeassistant_api: true
 stage: experimental
 timeout: 75
 breaking_versions:
   - "0.1.2"
+  - "0.1.9"
 services:
   - mqtt:need
 options:
   pa2_host: null
+  pa2_mac_address: ""
+  replace_saved_identity: false
   pa2_port: 19272
   pa2_username: administrator
   pa2_password_override: ""
@@ -29,6 +33,8 @@ options:
   discovery_prefix: homeassistant
 schema:
   pa2_host: str
+  pa2_mac_address: str
+  replace_saved_identity: bool
   pa2_port: port
   pa2_username: str
   pa2_password_override: password

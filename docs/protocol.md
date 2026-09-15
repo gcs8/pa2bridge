@@ -97,6 +97,8 @@ The live device returned numeric dB values including `-120.0`. MQTT meter public
 
 The PA2 also responds to UDP broadcast on port `19272`. `pa2ui` broadcasts read commands and learns the TCP endpoint from the UDP response source. PA2Bridge does not require UDP discovery because it uses a stable configured address. This avoids cross-VLAN broadcast dependence.
 
+The observed discovery response exposes `Class_Name`, `Instance_Name`, and `Software_Version`. None is a unique hardware identity: the class and firmware are shared, and the instance name is editable. No serial number, UUID, device-reported MAC, or comparable immutable identifier has been observed in the inspected PA2UI client or protocol capture. A bounded read-only listing of the physical device's `\\Node\AT` tree is still needed before concluding that firmware `1.2.0.1` exposes no such field.
+
 ## Concurrency
 
 PA2Bridge uses one client/session. `HiQnetClient` serializes command/response exchanges with a re-entrant lock, and `Pa2Controller` holds its own operation lock across the complete recall/confirm/unmute transaction. This prevents a polling `get` from consuming a command's response on the same socket.

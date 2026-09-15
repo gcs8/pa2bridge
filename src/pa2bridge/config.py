@@ -25,12 +25,14 @@ _PA2_KEYS = {
     "allowed_preset_slots",
     "connect_timeout",
     "host",
+    "mac_address",
     "password",
     "password_env",
     "poll_interval",
     "port",
     "post_recall_delay",
     "recall_timeout",
+    "replace_saved_identity",
     "username",
 }
 _MQTT_KEYS = {
@@ -115,6 +117,32 @@ def validate_network_host(value: Any, *, description: str) -> str:
     return value
 
 
+def normalize_mac_address(
+    value: Any,
+    *,
+    description: str,
+    allow_empty: bool = False,
+) -> str | None:
+    """Return a canonical MAC address for Home Assistant device matching."""
+
+    if allow_empty and value == "":
+        return None
+    if not isinstance(value, str) or value != value.strip():
+        raise ConfigError(f"{description} must be a MAC address")
+    match = re.fullmatch(
+        r"[0-9A-Fa-f]{2}([:-])[0-9A-Fa-f]{2}(?:\1[0-9A-Fa-f]{2}){4}",
+        value,
+        re.ASCII,
+    )
+    if match is None:
+        raise ConfigError(f"{description} must be a MAC address")
+    normalized = ":".join(re.findall(r"[0-9A-Fa-f]{2}", value)).lower()
+    octets = bytes.fromhex(normalized.replace(":", ""))
+    if octets == b"\x00" * 6 or octets[0] & 1:
+        raise ConfigError(f"{description} must be a unicast MAC address")
+    return normalized
+
+
 @dataclass(frozen=True)
 class Pa2Config:
     host: str
@@ -126,6 +154,8 @@ class Pa2Config:
     recall_timeout: float = 10.0
     poll_interval: float = 0.2
     post_recall_delay: float = 1.0
+    mac_address: str | None = None
+    replace_saved_identity: bool = False
 
 
 @dataclass(frozen=True)
@@ -334,6 +364,17 @@ def load_config(path: str | Path, *, environ: Mapping[str, str] | None = None) -
             _required_string(pa2_data, "host", "pa2"),
             description="[pa2].host",
         ),
+        mac_address=normalize_mac_address(
+            pa2_data.get("mac_address", ""),
+            description="[pa2].mac_address",
+            allow_empty=True,
+        ),
+        replace_saved_identity=_boolean_value(
+            pa2_data,
+            "replace_saved_identity",
+            "pa2",
+            default=False,
+        ),
         port=_port_value(pa2_data, "port", "pa2", default=19272),
         username=pa2_username(
             _string_value(pa2_data, "username", "pa2", default="administrator"),
@@ -378,6 +419,10 @@ def load_config(path: str | Path, *, environ: Mapping[str, str] | None = None) -
             allow_minimum=True,
         ),
     )
+    if pa2.replace_saved_identity and pa2.mac_address is None:
+        raise ConfigError(
+            "[pa2].replace_saved_identity requires [pa2].mac_address"
+        )
     mqtt = MqttConfig(
         host=validate_network_host(
             _required_string(mqtt_data, "host", "mqtt"),

@@ -5,6 +5,7 @@ from collections.abc import Iterable
 import pytest
 
 from pa2bridge.controller import (
+    ConnectionValidationError,
     DeviceIdentity,
     INPUT_CLIPS,
     INPUT_LEVELS,
@@ -656,6 +657,69 @@ def test_activate_reconnects_when_recall_closes_the_pa2_console() -> None:
     assert client.reconnects == 1
     assert state.current_preset.slot == 2
     assert state.all_outputs_unmuted is True
+
+
+def test_recall_reconnect_validation_failure_never_writes_replacement() -> None:
+    class ReplacementClient(RecallDisconnectClient):
+        sets_at_reconnect: int | None = None
+
+        def reconnect(self) -> None:
+            super().reconnect()
+            self.sets_at_reconnect = len(self.sets)
+
+    client = ReplacementClient()
+
+    def reject_reconnected_peer(deadline: float | None) -> None:
+        assert deadline is not None
+        raise ConnectionValidationError("replacement PA2 rejected")
+
+    controller = Pa2Controller(
+        client,
+        allowed_slots=(1, 2),
+        sleep=lambda _: None,
+        post_recall_delay=0,
+        reconnect_validator=reject_reconnected_peer,
+    )
+
+    with pytest.raises(ConnectionValidationError, match="replacement PA2"):
+        controller.activate_preset(2)
+
+    assert client.sets_at_reconnect is not None
+    assert len(client.sets) == client.sets_at_reconnect
+    assert not any(value == "Off" for _, value in client.sets)
+
+
+def test_rollback_reconnect_validation_failure_never_writes_replacement() -> None:
+    class FailedOldSessionClient(FakeClient):
+        reject_first_write = True
+        sets_at_reconnect: int | None = None
+
+        def set(self, path: Iterable[str], value: str) -> None:
+            if self.reject_first_write:
+                self.reject_first_write = False
+                raise ConnectionError("old session closed")
+            super().set(path, value)
+
+        def reconnect(self) -> None:
+            self.reconnects += 1
+            self.sets_at_reconnect = len(self.sets)
+
+    client = FailedOldSessionClient()
+
+    def reject_reconnected_peer(deadline: float | None) -> None:
+        raise ConnectionValidationError("replacement PA2 rejected")
+
+    controller = Pa2Controller(
+        client,
+        allowed_slots=(1, 2),
+        reconnect_validator=reject_reconnected_peer,
+    )
+
+    with pytest.raises(ConnectionValidationError, match="replacement PA2"):
+        controller._rollback_outputs_to_muted(OUTPUT_MUTES)
+
+    assert client.sets_at_reconnect == 0
+    assert client.sets == []
 
 
 def test_recall_timeout_never_unmutes_outputs() -> None:

@@ -360,7 +360,7 @@ wheels = [
 
 [[package]]
 name = "pa2bridge"
-version = "0.1.8"
+version = "0.1.9"
 source = { editable = "." }
 dependencies = [
     { name = "paho-mqtt" },

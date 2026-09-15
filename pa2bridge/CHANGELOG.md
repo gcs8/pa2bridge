@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.9
+
+- Discover the PA2 MAC by correlating the authenticated TCP peer with bounded, provenance-verified Home Assistant network-tracker data, persist the validated binding, and retry safely when current network data is temporarily unavailable. Conflicting identities fail closed. The App includes an explicit replacement workflow and healthy startup logs for MQTT, PA2 identity, preset count, and discovery publication.
+- Keep the App on Supervisor's normal container network so its MQTT service hostname retains the DNS behavior used by prior releases. Direct local-neighbour data can corroborate trusted tracker data but cannot establish identity alone, preventing same-prefix proxy ARP from assigning a router MAC to the PA2.
+- Record first-use address-only admission durably so a later socket or App restart cannot admit a replacement device until a MAC is validated.
+- On the first 0.1.9 start with a validated MAC, every MQTT entity unique ID changes from the prior address-derived form. Home Assistant normally reuses unchanged entity IDs after the old retained records are removed, but users should check and restore any registry customizations, automations, dashboards, or Stream Deck bindings that do not carry over.
+- Mark 0.1.9 as a breaking App version so Supervisor does not auto-update past the documented entity migration before the operator can record those bindings.
+
 ## 0.1.8
 
 - Reject invalid PA2 usernames and passwords during configuration loading, and report Home Assistant App configuration failures as concise structured errors without tracebacks or credential values.
