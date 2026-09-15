@@ -33,6 +33,7 @@ class FakeClient:
         self.mutes = {path: "On" for path in OUTPUT_MUTES.values()}
         self.bad_verify_path: tuple[str, ...] | None = None
         self.reconnects = 0
+        self.read_deadlines: list[float] = []
 
     def get(self, path: Iterable[str]) -> str:
         path = tuple(path)
@@ -73,7 +74,7 @@ class FakeClient:
         self.reconnects += 1
 
     def get_before(self, path: Iterable[str], *, deadline: float) -> str:
-        del deadline
+        self.read_deadlines.append(deadline)
         return self.get(path)
 
     def set_before(
@@ -92,7 +93,7 @@ class FakeClient:
         *,
         deadline: float,
     ) -> dict[str, str]:
-        del deadline
+        self.read_deadlines.append(deadline)
         return self.ls(path)
 
     def reconnect_before(self, *, deadline: float) -> None:
@@ -1656,6 +1657,22 @@ class TelemetryClient(FakeClient):
         if key == ("Preset", "Crossover", "SV"):
             return dict(self.crossover_sv)
         return super().ls(key)
+
+
+def test_read_only_snapshot_methods_share_the_callers_absolute_deadline() -> None:
+    client = TelemetryClient()
+    controller = Pa2Controller(client, allowed_slots=(1, 2))
+    deadline = 1_000_000_000_000.0
+
+    identity = controller.identity(deadline=deadline)
+    controller.list_all_presets(deadline=deadline)
+    controller.state(identity=identity, deadline=deadline)
+    controller.input_meters(deadline=deadline)
+    controller.output_levels(deadline=deadline)
+    controller.crossover(deadline=deadline)
+
+    assert client.read_deadlines
+    assert set(client.read_deadlines) == {deadline}
 
 
 def test_read_only_telemetry_exposes_full_inventory_input_and_output_meters() -> None:
