@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.1.8
+
+- Reject invalid PA2 usernames and passwords during configuration loading, and report Home Assistant App configuration failures as concise structured errors without tracebacks or credential values.
+- Remove obsolete retained Home Assistant discovery records when meter exposure, discovery prefixes, or device identities change. Persist a bounded ownership manifest before publication so interrupted cleanup remains recoverable without deleting unrelated topics.
+- Prevent MQTT shutdown lock inversion and handle SIGTERM through a bounded graceful-stop path. Home Assistant App and systemd shutdown budgets are now 75 seconds.
+- Skip every actuator write when the requested preset is already active, preserve the current output mute state, and report whether outputs were verified unmuted or left unchanged.
+- Expire MQTT actuator commands five seconds after callback receipt and carry that deadline through lock contention and preset preflight to the first protocol write. Commands that expire before any write do not trigger rollback writes.
+- Keep valid detail entities online during healthy periodic refreshes while still publishing retained offline status when refresh, identity, session, or preset validity fails.
+- Stabilize Windows and slow-loopback tests and remove invalid Python escape warnings without changing runtime behavior.
+
+### Standalone systemd upgrade
+
+Standalone users must replace `~/.config/systemd/user/pa2bridge.service` with this release's `deploy/pa2bridge.service`, then run:
+
+```console
+systemctl --user daemon-reload
+systemctl --user restart pa2bridge.service
+```
+
+This applies the 75-second shutdown budget and configures the durable discovery ownership state directory used to remove obsolete retained entities.
+
 ## 0.1.7
 
 - Reduce modeled steady-state PA2 request traffic by 27.2% by reusing device identity only within the current authenticated connection generation and deriving preset views from one validated catalog snapshot per refresh.
