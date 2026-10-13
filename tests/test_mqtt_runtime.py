@@ -3804,6 +3804,159 @@ def test_unexpected_post_actuation_failure_closes_pa2_and_publishes_offline(
     assert all(sentinel not in payload for _, payload, *_ in client.published)
 
 
+@pytest.mark.parametrize(
+    "transport_error",
+    [ConnectionRefusedError, TimeoutError, socket.gaierror],
+)
+def test_startup_transport_recovery_drives_production_poll_without_replay(
+    monkeypatch, transport_error, caplog,
+) -> None:
+    bridge, client, pa2, controller = make_bridge(
+        monkeypatch, pa2_mac_address="02:00:5e:10:00:01",
+    )
+    bridge._mqtt_connected = False
+    clock = [100.0]
+    attempts: list[float] = []
+    waits: list[float] = []
+    deadlines: list[float] = []
+    polls = 0
+    real_connect = client.connect
+    real_poll = bridge._poll_once
+    real_state = controller.state
+
+    def connect(host, port, keepalive):
+        attempts.append(clock[0])
+        assert controller.identity_calls == 0
+        assert client.published == []
+        if len(attempts) <= 7:
+            raise transport_error("synthetic transport failure")
+        real_connect(host, port, keepalive)
+
+    def wait(timeout):
+        waits.append(timeout)
+        assert 0 < timeout <= 0.5
+        clock[0] += timeout
+        return bridge._stop_event.is_set()
+
+    def state(*, identity=None, deadline=None):
+        assert deadline == clock[0] + 60.0
+        deadlines.append(deadline)
+        return real_state(identity=identity, deadline=deadline)
+
+    def poll():
+        nonlocal polls
+        real_poll()
+        polls += 1
+        if polls == 2:
+            bridge._stop_event.set()
+
+    monkeypatch.setattr(client, "connect", connect)
+    monkeypatch.setattr(bridge._stop_event, "wait", wait)
+    monkeypatch.setattr("pa2bridge.mqtt_bridge.time.monotonic", lambda: clock[0])
+    monkeypatch.setattr(controller, "state", state)
+    monkeypatch.setattr(bridge, "_poll_once", poll)
+    caplog.set_level("WARNING", logger="pa2bridge.mqtt_bridge")
+
+    bridge.run_forever()
+
+    assert attempts == [100.0, 101.0, 103.0, 107.0, 115.0, 131.0, 161.0, 191.0]
+    assert waits and polls == len(deadlines) == 2
+    assert client.reconnect_delays == (1, 30)
+    assert client.connected_to == ("homeassistant.local", 1883, 30)
+    assert client.loop_started == client.loop_stopped == client.disconnected == 1
+    assert pa2.connection_generation == 1 and pa2.closed == 1
+    assert client.subscriptions == [("driverack/pa2/command/#", 1)]
+    assert [(topic, payload) for topic, payload, *_ in client.published
+            if topic.endswith("/config")] == [
+        (entry.topic, entry.payload) for entry in bridge.discovery
+    ]
+    assert sum(topic == "driverack/pa2/state/preset"
+               for topic, *_ in client.published) == 2
+    assert controller.activations == controller.all_mutes == controller.channel_mutes == []
+    assert "synthetic transport failure" not in caplog.text
+    assert "pa2-secret" not in caplog.text and "mqtt-secret" not in caplog.text
+
+
+@pytest.mark.parametrize("stop_kind", ["event", "sigterm", "during_connect"])
+def test_startup_transport_retry_respects_owner_stop(monkeypatch, stop_kind) -> None:
+    bridge, client, pa2, controller = make_bridge(monkeypatch)
+    bridge._mqtt_connected = False
+    attempts = []
+    waits = []
+    clock = [100.0]
+
+    def connect(*args, **kwargs):
+        attempts.append(clock[0])
+        if stop_kind == "during_connect":
+            bridge._handle_sigterm(signal.SIGTERM, None)
+        raise ConnectionRefusedError("synthetic refusal")
+
+    def wait(timeout):
+        waits.append(timeout)
+        assert timeout <= 0.5
+        clock[0] += timeout
+        if stop_kind == "sigterm":
+            bridge._handle_sigterm(signal.SIGTERM, None)
+        else:
+            bridge._stop_event.set()
+        return bridge._stop_event.is_set()
+
+    monkeypatch.setattr(client, "connect", connect)
+    monkeypatch.setattr(bridge._stop_event, "wait", wait)
+    monkeypatch.setattr("pa2bridge.mqtt_bridge.time.monotonic", lambda: clock[0])
+
+    bridge.run_forever()
+
+    assert attempts == [100.0]
+    assert waits == ([] if stop_kind == "during_connect" else [0.5])
+    assert bridge._stop_event.is_set()
+    assert client.loop_started == client.loop_stopped == 0
+    assert client.published == [] and pa2.connection_generation == 0
+    assert pa2.closed == 1 and controller.identity_calls == 0
+    assert controller.activations == controller.all_mutes == controller.channel_mutes == []
+
+
+@pytest.mark.parametrize("failure", ["configuration", "connack", "suback", "deadline"])
+def test_startup_transport_retry_preserves_fatal_errors_and_ready_deadline(
+    monkeypatch, failure,
+) -> None:
+    bridge, client, pa2, controller = make_bridge(monkeypatch)
+    bridge._mqtt_connected = False
+    attempts = []
+    real_connect = client.connect
+
+    def connect(*args, **kwargs):
+        attempts.append(1)
+        if failure == "configuration":
+            raise ValueError("synthetic invalid configuration")
+        real_connect(*args, **kwargs)
+
+    monkeypatch.setattr(client, "connect", connect)
+    if failure == "connack":
+        def refused_loop():
+            client.loop_started += 1
+            client.on_connect(client, None, None, 5, None)
+        monkeypatch.setattr(client, "loop_start", refused_loop)
+    elif failure == "suback":
+        client.subscribe_reason_codes = [128]
+    elif failure == "deadline":
+        def no_callback_loop():
+            client.loop_started += 1
+        def ready_wait(timeout):
+            assert timeout == 10.0
+            return False
+        monkeypatch.setattr(client, "loop_start", no_callback_loop)
+        monkeypatch.setattr(bridge._mqtt_ready, "wait", ready_wait)
+
+    with pytest.raises(ValueError if failure == "configuration" else MqttPublishError):
+        bridge.run_forever()
+
+    assert attempts == [1]
+    assert client.loop_started == client.loop_stopped == (0 if failure == "configuration" else 1)
+    assert pa2.connection_generation == 0 and controller.identity_calls == 0
+    assert controller.activations == controller.all_mutes == controller.channel_mutes == []
+
+
 def test_run_forever_uses_paho_background_loop_for_automatic_broker_reconnect(monkeypatch) -> None:
     bridge, client, pa2, controller = make_bridge(monkeypatch)
     monkeypatch.setattr(
