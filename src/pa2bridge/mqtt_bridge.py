@@ -1178,6 +1178,7 @@ class MqttBridge:
 
             next_poll = 0.0
             reconnect_delay = 1.0
+            last_command_cleared = False
             while True:
                 self._apply_pending_sigterm()
                 if self._stop_event.is_set():
@@ -1196,6 +1197,20 @@ class MqttBridge:
                     if not mqtt_connected:
                         self._mqtt_state_changed.wait(timeout=0.5)
                         continue
+                if not last_command_cleared:
+                    # Clear previous-session results once, after SUBACK and
+                    # before admitting current-session commands or polling.
+                    topic = f"{self.config.mqtt.base_topic}/state/last_command"
+                    result = self._publish(topic, "", retain=True)
+                    if result is None:
+                        # A transient disconnect may win the readiness race.
+                        # Wait for the existing reconnect path before clearing.
+                        continue
+                    self._wait_for_publication(result, topic=topic)
+                    last_command_cleared = True
+                    self._apply_pending_sigterm()
+                    if self._stop_event.is_set():
+                        break
                 if self._process_queued_diagnostic():
                     continue
                 if self._process_queued_command():
