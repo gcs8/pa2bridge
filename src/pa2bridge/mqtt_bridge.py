@@ -1151,11 +1151,36 @@ class MqttBridge:
     def _run_forever(self) -> None:
         loop_started = False
         try:
-            self.mqtt.connect(
-                self.config.mqtt.host,
-                self.config.mqtt.port,
-                keepalive=MQTT_KEEPALIVE_SECONDS,
-            )
+            reconnect_delay = 1.0
+            while True:
+                self._apply_pending_sigterm()
+                if self._stop_event.is_set():
+                    return
+                try:
+                    self.mqtt.connect(
+                        self.config.mqtt.host,
+                        self.config.mqtt.port,
+                        keepalive=MQTT_KEEPALIVE_SECONDS,
+                    )
+                    break
+                except OSError:
+                    # Paho's automatic reconnect loop is not running yet. Match
+                    # its configured cadence without retrying configuration or
+                    # broker rejection errors, or changing PA2 transport timing.
+                    LOGGER.warning(
+                        "MQTT startup transport unavailable; retrying in %.1f seconds",
+                        reconnect_delay,
+                    )
+                    retry_at = time.monotonic() + reconnect_delay
+                    while True:
+                        self._apply_pending_sigterm()
+                        if self._stop_event.is_set():
+                            return
+                        remaining = retry_at - time.monotonic()
+                        if remaining <= 0:
+                            break
+                        self._stop_event.wait(timeout=min(0.5, remaining))
+                    reconnect_delay = min(reconnect_delay * 2, 30.0)
             self.mqtt.loop_start()
             loop_started = True
             self._apply_pending_sigterm()
