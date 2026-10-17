@@ -342,6 +342,160 @@ def mock_trusted_network_mac(monkeypatch, mac_address: str | None) -> None:
     )
 
 
+@pytest.mark.parametrize("previous_result", ["ERROR: command failed", "all outputs verified unmuted"])
+@pytest.mark.parametrize("base_topic", ["driverack/pa2", "isolated/pa2"])
+def test_startup_clears_previous_session_last_command_before_first_poll(
+    monkeypatch, previous_result, base_topic
+) -> None:
+    bridge, client, pa2, controller = make_bridge(monkeypatch)
+    bridge.config = AppConfig(
+        pa2=bridge.config.pa2,
+        mqtt=MqttConfig(host="broker.invalid", base_topic=base_topic),
+    )
+    topic = f"{base_topic}/state/last_command"
+    unrelated_topic = "another/bridge/state/last_command"
+    retained = {topic: previous_result, unrelated_topic: "unrelated error"}
+    original_publish = client.publish
+
+    def publish(target, payload, qos, retain):
+        if retain:
+            if payload:
+                retained[target] = payload
+            else:
+                retained.pop(target, None)
+        return original_publish(target, payload, qos, retain)
+
+    def first_poll():
+        assert topic not in retained
+        assert ("wait", topic) in client.events
+        assert retained[unrelated_topic] == "unrelated error"
+        # A current-session diagnostic must not be erased by later polling.
+        bridge._diagnostics.put_nowait("ERROR: command rejected")
+        assert bridge._process_queued_diagnostic()
+        bridge._stop_event.set()
+
+    monkeypatch.setattr(client, "publish", publish)
+    monkeypatch.setattr(bridge, "_poll_once", first_poll)
+    bridge.run_forever()
+
+    assert [entry for entry in client.published if entry[0] == topic] == [
+        (topic, "", 1, True),
+        (topic, "ERROR: command rejected", 1, True),
+    ]
+    assert retained[topic] == "ERROR: command rejected"
+    assert client.loop_started == client.loop_stopped == 1
+    assert pa2.connect_args is None
+    assert controller.activations == controller.all_mutes == controller.channel_mutes == []
+
+
+@pytest.mark.parametrize("stop_during_ack", [False, True])
+def test_startup_last_command_clear_observes_disconnect_and_stop_races(
+    monkeypatch, stop_during_ack
+) -> None:
+    bridge, client, pa2, controller = make_bridge(monkeypatch)
+    topic = f"{bridge.config.mqtt.base_topic}/state/last_command"
+    original_publish = bridge._publish
+    attempts = []
+    polls = []
+
+    def publish(target, payload, *, retain):
+        if target == topic and not attempts:
+            attempts.append("disconnect before publication")
+            bridge._on_disconnect(client, None, None, 7, None)
+            assert client.on_connect is not None
+            assert client.on_subscribe is not None
+            client.on_connect(client, None, None, 0, None)
+            client.on_subscribe(client, None, client.subscribe_mid, [0], None)
+            return None
+        result = original_publish(target, payload, retain=retain)
+        if target == topic and stop_during_ack:
+            assert result is not None
+            wait = result.wait_for_publish
+            def wait_and_stop(timeout=None):
+                wait(timeout=timeout)
+                bridge._handle_sigterm(signal.SIGTERM, None)
+            result.wait_for_publish = wait_and_stop
+        return result
+
+    def poll():
+        polls.append("poll")
+        bridge._stop_event.set()
+
+    monkeypatch.setattr(bridge, "_publish", publish)
+    monkeypatch.setattr(bridge, "_poll_once", poll)
+    bridge.run_forever()
+
+    assert attempts == ["disconnect before publication"]
+    assert polls == ([] if stop_during_ack else ["poll"])
+    assert client.published.count((topic, "", 1, True)) == 1
+    assert client.events.count(("wait", topic)) == 1
+    assert pa2.connect_args is None
+    assert controller.activations == controller.all_mutes == controller.channel_mutes == []
+
+
+@pytest.mark.parametrize("failure", ["publish", "acknowledgement"])
+def test_startup_last_command_clear_failure_prevents_poll_and_commands(
+    monkeypatch, failure
+) -> None:
+    bridge, client, pa2, controller = make_bridge(monkeypatch)
+    original_publish = client.publish
+    topic = f"{bridge.config.mqtt.base_topic}/state/last_command"
+
+    def publish(target, payload, qos, retain):
+        result = original_publish(target, payload, qos, retain)
+        if target == topic:
+            if failure == "publish":
+                result.rc = mqtt.MQTT_ERR_NO_CONN
+            else:
+                result.is_published = lambda: False
+        return result
+
+    monkeypatch.setattr(client, "publish", publish)
+    monkeypatch.setattr(bridge, "_poll_once", lambda: pytest.fail("poll after failed clear"))
+    monkeypatch.setattr(
+        bridge, "_process_queued_command", lambda: pytest.fail("command after failed clear")
+    )
+    with pytest.raises(MqttPublishError):
+        bridge.run_forever()
+
+    assert client.loop_started == client.loop_stopped == 1
+    assert pa2.connect_args is None
+    assert controller.activations == controller.all_mutes == controller.channel_mutes == []
+
+
+@pytest.mark.parametrize("failure", ["authentication", "subscription", "sigterm"])
+def test_startup_last_command_clear_requires_ready_session(monkeypatch, failure) -> None:
+    bridge, client, pa2, controller = make_bridge(monkeypatch)
+    topic = f"{bridge.config.mqtt.base_topic}/state/last_command"
+    if failure == "authentication":
+        def loop_start():
+            client.loop_started += 1
+            assert client.on_connect is not None
+            client.on_connect(
+                client, None, None,
+                mqtt.ReasonCode(mqtt.PacketTypes.CONNACK, "Not authorized"), None,
+            )
+        monkeypatch.setattr(client, "loop_start", loop_start)
+    elif failure == "subscription":
+        client.subscribe_reason_codes = [128]
+    else:
+        original_loop_start = client.loop_start
+        def loop_start():
+            original_loop_start()
+            bridge._handle_sigterm(signal.SIGTERM, None)
+        monkeypatch.setattr(client, "loop_start", loop_start)
+
+    if failure == "sigterm":
+        bridge.run_forever()
+    else:
+        with pytest.raises(MqttPublishError):
+            bridge.run_forever()
+
+    assert not any(target == topic for target, *_ in client.published)
+    assert pa2.connect_args is None
+    assert controller.activations == controller.all_mutes == controller.channel_mutes == []
+
+
 def test_custom_discovery_manifests_use_distinct_identity_state_files(
     monkeypatch,
     tmp_path: Path,
@@ -3822,7 +3976,8 @@ def test_run_forever_uses_paho_background_loop_for_automatic_broker_reconnect(mo
     discovery_publishes = [
         item for item in client.published if item[0].endswith("/config")
     ]
-    assert client.wait_for_publish_calls == len(discovery_publishes) + 2
+    assert client.wait_for_publish_calls == len(discovery_publishes) + 3
+    assert client.published.count(("driverack/pa2/state/last_command", "", 1, True)) == 1
     assert pa2.closed == 1
     assert ("driverack/pa2/status", "offline", 1, True) in client.published
 
